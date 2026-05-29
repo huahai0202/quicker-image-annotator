@@ -35,6 +35,7 @@ internal sealed partial class AnnotatorForm : Form
     private readonly AnimationFrameScheduler canvasRenderScheduler;
     private readonly ThrottledAction imePositionThrottle;
     private bool suspendDisplayCache;
+    private bool annotationsChanged = true;
     private Color strokeColor = AppStyles.DefaultStroke;
     private float strokeWidth = 4f;
     private const int MaxCachePixels = 6000000;
@@ -238,6 +239,11 @@ internal sealed partial class AnnotatorForm : Form
         }
     }
 
+    private void MarkAnnotationsChanged()
+    {
+        annotationsChanged = true;
+    }
+
     private bool CanUseDisplayCache(RectangleF view)
     {
         if (view.Width <= 0 || view.Height <= 0)
@@ -253,7 +259,7 @@ internal sealed partial class AnnotatorForm : Form
             Math.Max(1, (int)Math.Round(view.Width)),
             Math.Max(1, (int)Math.Round(view.Height)));
 
-        if (displayCache != null && displayCacheSize == targetSize)
+        if (displayCache != null && displayCacheSize == targetSize && !annotationsChanged)
         {
             return;
         }
@@ -261,6 +267,9 @@ internal sealed partial class AnnotatorForm : Form
         ResetDisplayCache();
         displayCache = new Bitmap(targetSize.Width, targetSize.Height);
         displayCacheSize = targetSize;
+        annotationsChanged = false;
+
+        float displayScale = targetSize.Width / (float)baseImage.Width;
 
         using (Graphics g = Graphics.FromImage(displayCache))
         {
@@ -268,6 +277,16 @@ internal sealed partial class AnnotatorForm : Form
             g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.DrawImage(baseImage, new Rectangle(0, 0, targetSize.Width, targetSize.Height));
+
+            if (items.Count > 0)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.ScaleTransform(displayScale, displayScale);
+                foreach (AnnotationItem item in items)
+                {
+                    DrawItem(g, item, displayScale);
+                }
+            }
         }
     }
 
@@ -327,26 +346,37 @@ internal sealed partial class AnnotatorForm : Form
         else
         {
             DrawVisibleImageRegion(e.Graphics, view, scale);
+
+            GraphicsState slowState = e.Graphics.Save();
+            e.Graphics.TranslateTransform(viewX, viewY);
+            e.Graphics.ScaleTransform(scale, scale);
+            foreach (AnnotationItem item in items)
+            {
+                DrawItem(e.Graphics, item, scale);
+            }
+            e.Graphics.Restore(slowState);
         }
 
         GraphicsState state = e.Graphics.Save();
         e.Graphics.TranslateTransform(viewX, viewY);
         e.Graphics.ScaleTransform(scale, scale);
 
-        foreach (AnnotationItem item in items)
+        if (drawing)
         {
-            DrawItem(e.Graphics, item, scale);
-        }
-
-        if (drawing && currentTool != ToolMode.Pen)
-        {
-            var preview = new AnnotationItem();
-            preview.Tool = currentTool;
-            preview.Start = startPoint;
-            preview.End = currentPoint;
-            preview.StrokeColor = strokeColor;
-            preview.StrokeWidth = strokeWidth;
-            DrawItem(e.Graphics, preview, scale);
+            if (currentTool == ToolMode.Pen && currentPenItem != null && currentPenItem.Points.Count > 1)
+            {
+                DrawItem(e.Graphics, currentPenItem, scale);
+            }
+            else if (currentTool != ToolMode.Pen)
+            {
+                var preview = new AnnotationItem();
+                preview.Tool = currentTool;
+                preview.Start = startPoint;
+                preview.End = currentPoint;
+                preview.StrokeColor = strokeColor;
+                preview.StrokeWidth = strokeWidth;
+                DrawItem(e.Graphics, preview, scale);
+            }
         }
 
         if (inlineTextEditing)
@@ -417,10 +447,7 @@ internal sealed partial class AnnotatorForm : Form
             }
             else if (item.Tool == ToolMode.Pen && item.Points.Count > 1)
             {
-                for (int i = 1; i < item.Points.Count; i++)
-                {
-                    g.DrawLine(pen, item.Points[i - 1], item.Points[i]);
-                }
+                g.DrawLines(pen, item.Points.ToArray());
             }
             else if (item.Tool == ToolMode.Text && !string.IsNullOrEmpty(item.Text))
             {
@@ -644,7 +671,6 @@ internal sealed partial class AnnotatorForm : Form
             currentPenItem.StrokeColor = strokeColor;
             currentPenItem.StrokeWidth = strokeWidth;
             currentPenItem.Points.Add(startPoint);
-            items.Add(currentPenItem);
         }
     }
 
@@ -708,6 +734,7 @@ internal sealed partial class AnnotatorForm : Form
             item.StrokeWidth = strokeWidth;
             item.Text = text;
             items.Add(item);
+            MarkAnnotationsChanged();
         }
         if (!IsDisposed && canvas.IsHandleCreated)
         {
@@ -890,9 +917,10 @@ internal sealed partial class AnnotatorForm : Form
         currentPoint = ToImagePoint(e.Location);
         if (currentTool == ToolMode.Pen)
         {
-            if (!IsMeaningfulAnnotation(currentPenItem))
+            if (currentPenItem != null && IsMeaningfulAnnotation(currentPenItem))
             {
-                items.Remove(currentPenItem);
+                items.Add(currentPenItem);
+                MarkAnnotationsChanged();
             }
         }
         else
@@ -906,6 +934,7 @@ internal sealed partial class AnnotatorForm : Form
             if (IsMeaningfulAnnotation(item))
             {
                 items.Add(item);
+                MarkAnnotationsChanged();
             }
         }
         currentPenItem = null;
@@ -924,6 +953,7 @@ internal sealed partial class AnnotatorForm : Form
             if (items.Count > 0)
             {
                 items.RemoveAt(items.Count - 1);
+                MarkAnnotationsChanged();
                 RequestCanvasRender();
             }
         }
