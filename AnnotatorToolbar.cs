@@ -22,19 +22,17 @@ internal sealed partial class AnnotatorForm
                 return;
             }
 
-            if (items.Count > 0)
-            {
-                items.RemoveAt(items.Count - 1);
-                MarkAnnotationsChanged();
-                RequestCanvasRender();
-            }
+            UndoAnnotationAction();
         });
         AddActionButton(ref toolbarX, ToolbarIconKind.Clear, "清空", delegate
         {
+            if (!ConfirmClearAnnotations())
+            {
+                return;
+            }
+
             CancelInlineTextInput();
-            items.Clear();
-            MarkAnnotationsChanged();
-            RequestCanvasRender();
+            ClearAnnotations();
         });
         AddActionButton(ref toolbarX, ToolbarIconKind.Fit, "适合窗口", delegate
         {

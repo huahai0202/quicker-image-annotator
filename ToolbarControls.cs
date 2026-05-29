@@ -235,9 +235,20 @@ internal sealed class ModernIconButton : Button
                     break;
 
                 case ToolbarIconKind.Arrow:
-                    g.DrawLine(pen, cx - 9, cy + 9, cx + 9, cy - 9);
-                    g.DrawLine(pen, cx + 9, cy - 9, cx + 8, cy + 1);
-                    g.DrawLine(pen, cx + 9, cy - 9, cx - 1, cy - 8);
+                    GraphicsState arrowState = g.Save();
+                    g.TranslateTransform(cx, cy);
+                    g.RotateTransform(-45f);
+                    g.FillPolygon(brush, new PointF[]
+                    {
+                        new PointF(-11f, -1.1f),
+                        new PointF(3f, -2.4f),
+                        new PointF(3f, -7f),
+                        new PointF(12f, 0f),
+                        new PointF(3f, 7f),
+                        new PointF(3f, 2.4f),
+                        new PointF(-11f, 1.1f)
+                    });
+                    g.Restore(arrowState);
                     break;
 
                 case ToolbarIconKind.Pen:

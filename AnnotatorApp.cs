@@ -4,6 +4,8 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 internal sealed partial class AnnotatorForm : Form
@@ -14,6 +16,7 @@ internal sealed partial class AnnotatorForm : Form
     private readonly ModernToolbarPanel toolbar = new ModernToolbarPanel();
     private readonly BufferedCanvas canvas = new BufferedCanvas();
     private readonly Dictionary<ToolMode, Button> toolButtons = new Dictionary<ToolMode, Button>();
+    private readonly Stack<AnnotationUndoAction> undoStack = new Stack<AnnotationUndoAction>();
     private readonly Panel toolOptionsPanel = new Panel();
     private readonly List<Button> colorButtons = new List<Button>();
     private readonly List<Button> widthButtons = new List<Button>();
@@ -26,8 +29,16 @@ internal sealed partial class AnnotatorForm : Form
     private PointF currentPoint;
     private Point lastPanPoint;
     private AnnotationItem currentPenItem;
+    private int selectedItemIndex = -1;
+    private bool movingSelection;
+    private PointF lastMovePoint;
+    private PointF moveStartPoint;
+    private PointF moveCurrentPoint;
+    private bool selectionMoved;
     private Bitmap displayCache;
     private Size displayCacheSize = Size.Empty;
+    private Bitmap moveBackgroundCache;
+    private Size moveBackgroundCacheSize = Size.Empty;
     private Icon windowIcon;
     private float zoomFactor = 1f;
     private PointF viewOffset = PointF.Empty;
@@ -40,13 +51,129 @@ internal sealed partial class AnnotatorForm : Form
     private float strokeWidth = 4f;
     private const int MaxCachePixels = 6000000;
     private const float MinAnnotationExtent = 2f;
+    private const float SelectionHitTolerancePixels = 8f;
+    private const float MoveSampleThresholdPixels = 0.5f;
+    private const float PenSampleThresholdPixels = 0.9f;
     private bool inlineTextEditing;
-    private TextBox inlineTextBox;
+    private InlineImeTextBox inlineTextBox;
     private string inlineText = string.Empty;
+    private string inlineCompositionText = string.Empty;
+    private bool inlineTextSelecting;
+    private int inlineTextSelectionAnchor;
     private bool inlineCaretVisible;
     private readonly Timer inlineCaretTimer = new Timer();
     private PointF textInputPosition;
     private const int MosaicBlockSize = 18;
+
+    private enum AnnotationUndoKind
+    {
+        Add,
+        Delete
+    }
+
+    private sealed class AnnotationUndoAction
+    {
+        public readonly AnnotationUndoKind Kind;
+        public readonly AnnotationItem Item;
+        public readonly int Index;
+
+        public AnnotationUndoAction(AnnotationUndoKind kind, AnnotationItem item, int index)
+        {
+            Kind = kind;
+            Item = item;
+            Index = index;
+        }
+    }
+
+    private sealed class InlineImeTextBox : TextBox
+    {
+        private const int WmImeComposition = 0x010F;
+        private const int WmImeEndComposition = 0x010E;
+        private const int GcsCompReadStr = 0x0001;
+        private const int GcsCompStr = 0x0008;
+
+        public event EventHandler CompositionChanged;
+        public string CompositionText = string.Empty;
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WmImeComposition)
+            {
+                SetCompositionText(GetCurrentCompositionText(Handle));
+            }
+            else if (m.Msg == WmImeEndComposition)
+            {
+                SetCompositionText(string.Empty);
+            }
+        }
+
+        private void SetCompositionText(string value)
+        {
+            value = value ?? string.Empty;
+            if (string.Equals(CompositionText, value, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            CompositionText = value;
+            EventHandler handler = CompositionChanged;
+            if (handler != null)
+            {
+                handler(this, EventArgs.Empty);
+            }
+        }
+
+        private static string GetCurrentCompositionText(IntPtr handle)
+        {
+            string readingText = GetCompositionString(handle, GcsCompReadStr);
+            if (!string.IsNullOrEmpty(readingText))
+            {
+                return readingText;
+            }
+            return GetCompositionString(handle, GcsCompStr);
+        }
+
+        private static string GetCompositionString(IntPtr handle, int kind)
+        {
+            IntPtr context = ImmGetContext(handle);
+            if (context == IntPtr.Zero)
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                int byteCount = ImmGetCompositionString(context, kind, null, 0);
+                if (byteCount <= 0)
+                {
+                    return string.Empty;
+                }
+
+                byte[] buffer = new byte[byteCount];
+                int copied = ImmGetCompositionString(context, kind, buffer, buffer.Length);
+                if (copied <= 0)
+                {
+                    return string.Empty;
+                }
+
+                return Encoding.Unicode.GetString(buffer, 0, copied).TrimEnd('\0');
+            }
+            finally
+            {
+                ImmReleaseContext(handle, context);
+            }
+        }
+
+        [DllImport("imm32.dll")]
+        private static extern IntPtr ImmGetContext(IntPtr hWnd);
+
+        [DllImport("imm32.dll")]
+        private static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+
+        [DllImport("imm32.dll", CharSet = CharSet.Unicode)]
+        private static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, byte[] lpBuf, int dwBufLen);
+    }
 
     public AnnotatorForm(string path, Bitmap image)
     {
@@ -156,6 +283,7 @@ internal sealed partial class AnnotatorForm : Form
                 windowIcon.Dispose();
                 windowIcon = null;
             }
+            ResetMoveBackgroundCache();
             ResetDisplayCache();
         }
         base.Dispose(disposing);
@@ -239,9 +367,46 @@ internal sealed partial class AnnotatorForm : Form
         }
     }
 
+    private void ResetMoveBackgroundCache()
+    {
+        if (moveBackgroundCache != null)
+        {
+            moveBackgroundCache.Dispose();
+            moveBackgroundCache = null;
+            moveBackgroundCacheSize = Size.Empty;
+        }
+    }
+
     private void MarkAnnotationsChanged()
     {
         annotationsChanged = true;
+    }
+
+    private void SuspendDisplayCacheForInteraction()
+    {
+        suspendDisplayCache = true;
+        cacheRefreshTimer.Stop();
+    }
+
+    private void ResumeDisplayCacheAfterInteraction(bool changed)
+    {
+        suspendDisplayCache = false;
+        cacheRefreshTimer.Stop();
+        ResetMoveBackgroundCache();
+        if (changed)
+        {
+            MarkAnnotationsChanged();
+        }
+    }
+
+    private float CanvasPixelsToImageDistance(float pixels)
+    {
+        float scale = GetScale();
+        if (scale <= 0)
+        {
+            return pixels;
+        }
+        return Math.Max(0.01f, pixels / scale);
     }
 
     private bool CanUseDisplayCache(RectangleF view)
@@ -281,12 +446,60 @@ internal sealed partial class AnnotatorForm : Form
             if (items.Count > 0)
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.ScaleTransform(displayScale, displayScale);
-                foreach (AnnotationItem item in items)
-                {
-                    DrawItem(g, item, displayScale);
-                }
+                g.ScaleTransform(displayScale, displayScale, MatrixOrder.Prepend);
+                DrawAnnotations(g, displayScale, -1);
             }
+        }
+    }
+
+    private void EnsureMoveBackgroundCache(RectangleF view)
+    {
+        if (!HasSelectedItem() || !CanUseDisplayCache(view))
+        {
+            ResetMoveBackgroundCache();
+            return;
+        }
+
+        var targetSize = new Size(
+            Math.Max(1, (int)Math.Round(view.Width)),
+            Math.Max(1, (int)Math.Round(view.Height)));
+
+        if (moveBackgroundCache != null && moveBackgroundCacheSize == targetSize)
+        {
+            return;
+        }
+
+        ResetMoveBackgroundCache();
+        moveBackgroundCache = new Bitmap(targetSize.Width, targetSize.Height);
+        moveBackgroundCacheSize = targetSize;
+
+        float displayScale = targetSize.Width / (float)baseImage.Width;
+        using (Graphics g = Graphics.FromImage(moveBackgroundCache))
+        {
+            g.Clear(AppStyles.CanvasBackground);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.DrawImage(baseImage, new Rectangle(0, 0, targetSize.Width, targetSize.Height));
+
+            if (items.Count > 0)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.ScaleTransform(displayScale, displayScale, MatrixOrder.Prepend);
+                DrawAnnotations(g, displayScale, selectedItemIndex);
+            }
+        }
+    }
+
+    private void DrawAnnotations(Graphics g, float scale, int skipIndex)
+    {
+        for (int i = 0; i < items.Count; i++)
+        {
+            if (i == skipIndex)
+            {
+                continue;
+            }
+
+            DrawItem(g, items[i], scale);
         }
     }
 
@@ -337,29 +550,38 @@ internal sealed partial class AnnotatorForm : Form
         int viewX = (int)Math.Round(view.X);
         int viewY = (int)Math.Round(view.Y);
         float scale = view.Width / baseImage.Width;
-        if (!suspendDisplayCache && CanUseDisplayCache(view))
+        bool drewMovingBackground = false;
+        if (movingSelection && HasSelectedItem())
+        {
+            EnsureMoveBackgroundCache(view);
+            if (moveBackgroundCache != null)
+            {
+                scale = (float)moveBackgroundCache.Width / baseImage.Width;
+                e.Graphics.DrawImageUnscaled(moveBackgroundCache, viewX, viewY);
+                drewMovingBackground = true;
+            }
+        }
+
+        if (!drewMovingBackground && !suspendDisplayCache && CanUseDisplayCache(view))
         {
             EnsureDisplayCache(view);
             scale = (float)displayCache.Width / baseImage.Width;
             e.Graphics.DrawImageUnscaled(displayCache, viewX, viewY);
         }
-        else
+        else if (!drewMovingBackground)
         {
             DrawVisibleImageRegion(e.Graphics, view, scale);
 
             GraphicsState slowState = e.Graphics.Save();
-            e.Graphics.TranslateTransform(viewX, viewY);
-            e.Graphics.ScaleTransform(scale, scale);
-            foreach (AnnotationItem item in items)
-            {
-                DrawItem(e.Graphics, item, scale);
-            }
+            e.Graphics.TranslateTransform(viewX, viewY, MatrixOrder.Prepend);
+            e.Graphics.ScaleTransform(scale, scale, MatrixOrder.Prepend);
+            DrawAnnotations(e.Graphics, scale, movingSelection ? selectedItemIndex : -1);
             e.Graphics.Restore(slowState);
         }
 
         GraphicsState state = e.Graphics.Save();
-        e.Graphics.TranslateTransform(viewX, viewY);
-        e.Graphics.ScaleTransform(scale, scale);
+        e.Graphics.TranslateTransform(viewX, viewY, MatrixOrder.Prepend);
+        e.Graphics.ScaleTransform(scale, scale, MatrixOrder.Prepend);
 
         if (drawing)
         {
@@ -377,6 +599,21 @@ internal sealed partial class AnnotatorForm : Form
                 preview.StrokeWidth = strokeWidth;
                 DrawItem(e.Graphics, preview, scale);
             }
+        }
+
+        if (movingSelection && HasSelectedItem())
+        {
+            GraphicsState moveState = e.Graphics.Save();
+            PointF offset = GetMoveOffset();
+            // Prepend keeps the move offset in image coordinates under the current view scale.
+            e.Graphics.TranslateTransform(offset.X, offset.Y, MatrixOrder.Prepend);
+            DrawItem(e.Graphics, items[selectedItemIndex], scale);
+            DrawSelection(e.Graphics, items[selectedItemIndex], scale);
+            e.Graphics.Restore(moveState);
+        }
+        else if (HasSelectedItem())
+        {
+            DrawSelection(e.Graphics, items[selectedItemIndex], scale);
         }
 
         if (inlineTextEditing)
@@ -415,6 +652,12 @@ internal sealed partial class AnnotatorForm : Form
         Color itemColor = item.StrokeColor.IsEmpty ? strokeColor : item.StrokeColor;
         float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
 
+        if (item.Tool == ToolMode.Arrow)
+        {
+            DrawFilledArrow(g, item, itemColor, itemWidth);
+            return;
+        }
+
         using (var pen = new Pen(itemColor, Math.Max(0.1f, itemWidth)))
         {
             pen.StartCap = LineCap.Round;
@@ -437,17 +680,9 @@ internal sealed partial class AnnotatorForm : Form
                 float h = Math.Abs(item.End.Y - item.Start.Y);
                 g.DrawEllipse(pen, x, y, w, h);
             }
-            else if (item.Tool == ToolMode.Arrow)
-            {
-                using (var cap = new AdjustableArrowCap(7f, 9f, true))
-                {
-                    pen.CustomEndCap = cap;
-                    g.DrawLine(pen, item.Start, item.End);
-                }
-            }
             else if (item.Tool == ToolMode.Pen && item.Points.Count > 1)
             {
-                g.DrawLines(pen, item.Points.ToArray());
+                g.DrawLines(pen, item.GetDrawingPoints());
             }
             else if (item.Tool == ToolMode.Text && !string.IsNullOrEmpty(item.Text))
             {
@@ -465,35 +700,351 @@ internal sealed partial class AnnotatorForm : Form
         }
     }
 
+    private static void DrawFilledArrow(Graphics g, AnnotationItem item, Color color, float width)
+    {
+        PointF[] points = BuildFilledArrowPoints(item, width);
+        if (points.Length == 0)
+        {
+            return;
+        }
+
+        using (Brush brush = new SolidBrush(color))
+        {
+            g.FillPolygon(brush, points);
+        }
+    }
+
+    private static PointF[] BuildFilledArrowPoints(AnnotationItem item, float width)
+    {
+        float dx = item.End.X - item.Start.X;
+        float dy = item.End.Y - item.Start.Y;
+        float length = (float)Math.Sqrt(dx * dx + dy * dy);
+        if (length < MinAnnotationExtent)
+        {
+            return new PointF[0];
+        }
+
+        float ux = dx / length;
+        float uy = dy / length;
+        float nx = -uy;
+        float ny = ux;
+
+        float headLength = Math.Min(length * 0.55f, Math.Max(14f, width * 5.5f));
+        float tailHalf = Math.Max(0.7f, width * 0.22f);
+        float neckHalf = Math.Max(1.2f, width * 0.65f);
+        float headHalf = Math.Max(neckHalf * 2.2f, width * 2.4f);
+
+        PointF neck = new PointF(
+            item.End.X - ux * headLength,
+            item.End.Y - uy * headLength);
+
+        return new PointF[]
+        {
+            OffsetPoint(item.Start, nx, ny, -tailHalf),
+            OffsetPoint(neck, nx, ny, -neckHalf),
+            OffsetPoint(neck, nx, ny, -headHalf),
+            item.End,
+            OffsetPoint(neck, nx, ny, headHalf),
+            OffsetPoint(neck, nx, ny, neckHalf),
+            OffsetPoint(item.Start, nx, ny, tailHalf)
+        };
+    }
+
+    private static PointF OffsetPoint(PointF point, float normalX, float normalY, float distance)
+    {
+        return new PointF(point.X + normalX * distance, point.Y + normalY * distance);
+    }
+
+    private void DrawSelection(Graphics g, AnnotationItem item, float scale)
+    {
+        RectangleF bounds = GetItemBounds(item);
+        if (bounds.IsEmpty)
+        {
+            return;
+        }
+
+        float safeScale = Math.Max(0.001f, scale);
+        float padding = Math.Max(2f, 4f / safeScale);
+        bounds.Inflate(padding, padding);
+
+        float lineWidth = Math.Max(0.1f, 1.25f / safeScale);
+        using (Pen pen = new Pen(AppStyles.OptionSelectedForeground, lineWidth))
+        using (Brush handleBrush = new SolidBrush(Color.White))
+        using (Pen handlePen = new Pen(AppStyles.OptionSelectedForeground, lineWidth))
+        {
+            pen.DashStyle = DashStyle.Dash;
+            g.DrawRectangle(pen, bounds.X, bounds.Y, bounds.Width, bounds.Height);
+
+            float handleSize = Math.Max(2.5f, 6f / safeScale);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Top, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Top, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Bottom, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Bottom, handleSize);
+        }
+    }
+
+    private static void DrawSelectionHandle(Graphics g, Brush brush, Pen pen, float x, float y, float size)
+    {
+        RectangleF rect = new RectangleF(x - size / 2f, y - size / 2f, size, size);
+        g.FillRectangle(brush, rect);
+        g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+    }
+
+    private RectangleF GetItemBounds(AnnotationItem item)
+    {
+        if (item == null)
+        {
+            return RectangleF.Empty;
+        }
+
+        float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
+        RectangleF bounds;
+        if (item.Tool == ToolMode.Rect || item.Tool == ToolMode.Ellipse || item.Tool == ToolMode.Mosaic)
+        {
+            bounds = NormalizeRect(item.Start, item.End);
+        }
+        else if (item.Tool == ToolMode.Arrow)
+        {
+            bounds = BoundsFromPoints(item.Start, item.End);
+            bounds.Inflate(Math.Max(6f, itemWidth * 3f), Math.Max(6f, itemWidth * 3f));
+        }
+        else if (item.Tool == ToolMode.Pen)
+        {
+            bounds = GetPointsBounds(item.Points);
+            bounds.Inflate(Math.Max(2f, itemWidth), Math.Max(2f, itemWidth));
+        }
+        else if (item.Tool == ToolMode.Text)
+        {
+            bounds = GetTextBounds(item);
+        }
+        else
+        {
+            bounds = BoundsFromPoints(item.Start, item.End);
+        }
+
+        if (bounds.Width < 1f)
+        {
+            bounds.Inflate(0.5f, 0f);
+        }
+        if (bounds.Height < 1f)
+        {
+            bounds.Inflate(0f, 0.5f);
+        }
+        return bounds;
+    }
+
+    private RectangleF GetTextBounds(AnnotationItem item)
+    {
+        string text = item.Text ?? string.Empty;
+        float fontSize = Math.Max(1f, item.StrokeWidth * 6f);
+        if (text.Length == 0)
+        {
+            return new RectangleF(item.Start.X, item.Start.Y, fontSize, fontSize);
+        }
+
+        using (Graphics g = canvas.CreateGraphics())
+        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
+        using (StringFormat format = CreateInlineTextFormat())
+        {
+            SizeF size = g.MeasureString(text, font, int.MaxValue, format);
+            return new RectangleF(item.Start, size);
+        }
+    }
+
+    private static RectangleF GetPointsBounds(List<PointF> points)
+    {
+        if (points == null || points.Count == 0)
+        {
+            return RectangleF.Empty;
+        }
+
+        float left = points[0].X;
+        float right = points[0].X;
+        float top = points[0].Y;
+        float bottom = points[0].Y;
+        for (int i = 1; i < points.Count; i++)
+        {
+            left = Math.Min(left, points[i].X);
+            right = Math.Max(right, points[i].X);
+            top = Math.Min(top, points[i].Y);
+            bottom = Math.Max(bottom, points[i].Y);
+        }
+        return RectangleF.FromLTRB(left, top, right, bottom);
+    }
+
+    private static RectangleF BoundsFromPoints(PointF a, PointF b)
+    {
+        return RectangleF.FromLTRB(
+            Math.Min(a.X, b.X),
+            Math.Min(a.Y, b.Y),
+            Math.Max(a.X, b.X),
+            Math.Max(a.Y, b.Y));
+    }
+
     private void DrawInlineTextInput(Graphics g, float scale)
     {
         float fontSize = strokeWidth * 6f;
         string text = inlineText ?? string.Empty;
+        string composition = inlineCompositionText ?? string.Empty;
         using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
         using (Brush textBrush = new SolidBrush(strokeColor))
-        using (StringFormat format = new StringFormat(StringFormat.GenericTypographic))
+        using (StringFormat format = CreateInlineTextFormat())
         {
-            if (text.Length > 0)
-            {
-                g.DrawString(text, font, textBrush, textInputPosition);
-            }
+            int selectionStart = GetInlineSelectionStart();
+            int selectionLength = GetInlineSelectionLength();
+            selectionStart = Math.Max(0, Math.Min(text.Length, selectionStart));
+            selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, selectionLength));
+            int caretIndex = GetInlineCaretIndex();
+            float textHeight = MeasureInlineTextHeight(g, font, format);
 
-            if (inlineCaretVisible)
+            if (composition.Length > 0)
             {
-                float caretX = textInputPosition.X;
-                if (text.Length > 0)
+                int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
+                insertionIndex = Math.Max(0, Math.Min(text.Length, insertionIndex));
+                int replaceEnd = selectionLength > 0 ? selectionStart + selectionLength : insertionIndex;
+                string beforeText = text.Substring(0, insertionIndex);
+                string afterText = text.Substring(replaceEnd);
+                float beforeWidth = MeasureInlineTextWidth(g, font, format, beforeText, beforeText.Length);
+                float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
+                float compositionX = textInputPosition.X + beforeWidth;
+
+                if (beforeText.Length > 0)
                 {
-                    caretX += g.MeasureString(text, font, int.MaxValue, format).Width;
+                    g.DrawString(beforeText, font, textBrush, textInputPosition);
+                }
+                g.DrawString(composition, font, textBrush, new PointF(compositionX, textInputPosition.Y));
+                if (afterText.Length > 0)
+                {
+                    g.DrawString(afterText, font, textBrush, new PointF(compositionX + compositionWidth, textInputPosition.Y));
+                }
+                using (Pen compositionPen = new Pen(strokeColor, Math.Max(0.8f, 1f / Math.Max(0.001f, scale))))
+                {
+                    float underlineY = textInputPosition.Y + textHeight - Math.Max(1.2f, 2f / Math.Max(0.001f, scale));
+                    g.DrawLine(compositionPen, compositionX, underlineY, compositionX + Math.Max(1f, compositionWidth), underlineY);
                 }
 
-                float caretHeight = g.MeasureString("M", font, int.MaxValue, format).Height;
-                float caretWidth = Math.Max(1f, 1f / Math.Max(0.001f, scale));
-                using (Pen caretPen = new Pen(strokeColor, caretWidth))
+                if (inlineCaretVisible)
                 {
-                    g.DrawLine(caretPen, caretX, textInputPosition.Y, caretX, textInputPosition.Y + caretHeight);
+                    DrawInlineCaret(g, compositionX + compositionWidth, textHeight, scale);
+                }
+                return;
+            }
+
+            DrawCommittedInlineText(g, font, format, textBrush, text, selectionStart, selectionLength, textHeight);
+
+            if (inlineCaretVisible && selectionLength == 0)
+            {
+                float caretX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, caretIndex);
+                DrawInlineCaret(g, caretX, textHeight, scale);
+            }
+        }
+    }
+
+    private void DrawCommittedInlineText(Graphics g, Font font, StringFormat format, Brush textBrush, string text, int selectionStart, int selectionLength, float textHeight)
+    {
+        if (selectionLength > 0)
+        {
+            float selectionX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, selectionStart);
+            string selectedText = text.Substring(selectionStart, selectionLength);
+            float selectionWidth = MeasureInlineTextWidth(g, font, format, selectedText, selectedText.Length);
+            using (Brush selectionBrush = new SolidBrush(Color.FromArgb(190, AppStyles.OptionSelectedForeground)))
+            {
+                g.FillRectangle(selectionBrush, selectionX, textInputPosition.Y, Math.Max(1f, selectionWidth), textHeight);
+            }
+        }
+
+        if (text.Length > 0)
+        {
+            g.DrawString(text, font, textBrush, textInputPosition);
+            if (selectionLength > 0)
+            {
+                string selectedText = text.Substring(selectionStart, selectionLength);
+                float selectionX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, selectionStart);
+                using (Brush selectedTextBrush = new SolidBrush(Color.White))
+                {
+                    g.DrawString(selectedText, font, selectedTextBrush, new PointF(selectionX, textInputPosition.Y));
                 }
             }
         }
+    }
+
+    private void DrawInlineCaret(Graphics g, float caretX, float textHeight, float scale)
+    {
+        float caretWidth = Math.Max(1f, 1f / Math.Max(0.001f, scale));
+        using (Pen caretPen = new Pen(strokeColor, caretWidth))
+        {
+            g.DrawLine(caretPen, caretX, textInputPosition.Y, caretX, textInputPosition.Y + textHeight);
+        }
+    }
+
+    private static float MeasureInlineTextWidth(Graphics g, Font font, StringFormat format, string text, int count)
+    {
+        if (string.IsNullOrEmpty(text) || count <= 0)
+        {
+            return 0f;
+        }
+
+        count = Math.Min(count, text.Length);
+        string measuredText = text.Substring(0, count);
+        using (StringFormat measureFormat = (StringFormat)format.Clone())
+        {
+            measureFormat.SetMeasurableCharacterRanges(new CharacterRange[] { new CharacterRange(0, measuredText.Length) });
+            RectangleF layout = new RectangleF(0, 0, 100000, 10000);
+            Region[] regions = g.MeasureCharacterRanges(measuredText, font, layout, measureFormat);
+            try
+            {
+                if (regions.Length > 0)
+                {
+                    RectangleF bounds = regions[0].GetBounds(g);
+                    if (bounds.Right > 0)
+                    {
+                        return bounds.Right;
+                    }
+                }
+            }
+            finally
+            {
+                for (int i = 0; i < regions.Length; i++)
+                {
+                    regions[i].Dispose();
+                }
+            }
+        }
+
+        return g.MeasureString(measuredText, font, int.MaxValue, format).Width;
+    }
+
+    private static float MeasureInlineTextHeight(Graphics g, Font font, StringFormat format)
+    {
+        return g.MeasureString("M", font, int.MaxValue, format).Height;
+    }
+
+    private float MeasureInlineEditingWidth(Graphics g, Font font, StringFormat format, string text, string composition)
+    {
+        text = text ?? string.Empty;
+        composition = composition ?? string.Empty;
+        if (composition.Length == 0)
+        {
+            return Math.Max(font.Size, MeasureInlineTextWidth(g, font, format, text, text.Length));
+        }
+
+        int selectionStart = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
+        int selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, GetInlineSelectionLength()));
+        int caretIndex = Math.Max(0, Math.Min(text.Length, GetInlineCaretIndex()));
+        int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
+        int replaceEnd = selectionLength > 0 ? selectionStart + selectionLength : insertionIndex;
+        float beforeWidth = MeasureInlineTextWidth(g, font, format, text, insertionIndex);
+        float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
+        string afterText = text.Substring(replaceEnd);
+        float afterWidth = MeasureInlineTextWidth(g, font, format, afterText, afterText.Length);
+        return Math.Max(font.Size, beforeWidth + compositionWidth + afterWidth);
+    }
+
+    private static StringFormat CreateInlineTextFormat()
+    {
+        StringFormat format = new StringFormat(StringFormat.GenericTypographic);
+        format.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces;
+        return format;
     }
 
     private void DrawMosaic(Graphics g, AnnotationItem item)
@@ -631,6 +1182,312 @@ internal sealed partial class AnnotatorForm : Form
         return (float)Math.Sqrt(dx * dx + dy * dy);
     }
 
+    private bool HasSelectedItem()
+    {
+        return selectedItemIndex >= 0 && selectedItemIndex < items.Count;
+    }
+
+    private void ClearSelection()
+    {
+        bool wasMoving = movingSelection;
+        bool moved = selectionMoved;
+        selectedItemIndex = -1;
+        movingSelection = false;
+        selectionMoved = false;
+        if (wasMoving)
+        {
+            ResumeDisplayCacheAfterInteraction(moved);
+        }
+    }
+
+    private void SelectAnnotation(int index)
+    {
+        if (index < 0 || index >= items.Count)
+        {
+            ClearSelection();
+            return;
+        }
+
+        selectedItemIndex = index;
+        movingSelection = false;
+        selectionMoved = false;
+    }
+
+    private void AddAnnotation(AnnotationItem item)
+    {
+        if (item == null)
+        {
+            return;
+        }
+
+        int index = items.Count;
+        items.Add(item);
+        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Add, item, index));
+        SelectAnnotation(index);
+        MarkAnnotationsChanged();
+    }
+
+    private bool DeleteSelectedAnnotation()
+    {
+        if (!HasSelectedItem())
+        {
+            return false;
+        }
+
+        int index = selectedItemIndex;
+        AnnotationItem item = items[index];
+        items.RemoveAt(index);
+        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Delete, item, index));
+        ClearSelection();
+        MarkAnnotationsChanged();
+        RequestCanvasRender();
+        return true;
+    }
+
+    private void UndoAnnotationAction()
+    {
+        if (undoStack.Count > 0)
+        {
+            AnnotationUndoAction action = undoStack.Pop();
+            if (action.Kind == AnnotationUndoKind.Add)
+            {
+                int index = items.IndexOf(action.Item);
+                if (index >= 0)
+                {
+                    items.RemoveAt(index);
+                    if (selectedItemIndex == index)
+                    {
+                        ClearSelection();
+                    }
+                    else if (selectedItemIndex > index)
+                    {
+                        selectedItemIndex--;
+                    }
+                }
+            }
+            else if (action.Kind == AnnotationUndoKind.Delete && action.Item != null)
+            {
+                int index = Math.Max(0, Math.Min(action.Index, items.Count));
+                items.Insert(index, action.Item);
+                SelectAnnotation(index);
+            }
+
+            MarkAnnotationsChanged();
+            RequestCanvasRender();
+            return;
+        }
+
+        if (items.Count > 0)
+        {
+            items.RemoveAt(items.Count - 1);
+            if (selectedItemIndex >= items.Count)
+            {
+                ClearSelection();
+            }
+            MarkAnnotationsChanged();
+            RequestCanvasRender();
+        }
+    }
+
+    private void ClearAnnotations()
+    {
+        items.Clear();
+        undoStack.Clear();
+        ClearSelection();
+        MarkAnnotationsChanged();
+        RequestCanvasRender();
+    }
+
+    private bool ConfirmClearAnnotations()
+    {
+        if (items.Count == 0 && !inlineTextEditing)
+        {
+            return false;
+        }
+
+        DialogResult result = MessageBox.Show(
+            this,
+            "确定要清空当前标注内容吗？此操作无法撤销。",
+            "清空标注",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        return result == DialogResult.Yes;
+    }
+
+    private int HitTestAnnotation(PointF point)
+    {
+        float tolerance = GetSelectionHitTolerance();
+        for (int i = items.Count - 1; i >= 0; i--)
+        {
+            if (IsPointInAnnotation(point, items[i], tolerance))
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private float GetSelectionHitTolerance()
+    {
+        float scale = GetScale();
+        if (scale <= 0)
+        {
+            return SelectionHitTolerancePixels;
+        }
+        return Math.Max(2f, SelectionHitTolerancePixels / scale);
+    }
+
+    private bool IsPointInAnnotation(PointF point, AnnotationItem item, float tolerance)
+    {
+        if (item == null)
+        {
+            return false;
+        }
+
+        float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
+        if (item.Tool == ToolMode.Arrow)
+        {
+            return IsPointInFilledArrow(point, item, itemWidth, tolerance);
+        }
+
+        if (item.Tool == ToolMode.Pen)
+        {
+            if (item.Points.Count == 1)
+            {
+                return Distance(point, item.Points[0]) <= tolerance;
+            }
+
+            float threshold = Math.Max(tolerance, itemWidth * 0.75f);
+            for (int i = 1; i < item.Points.Count; i++)
+            {
+                if (DistanceToSegment(point, item.Points[i - 1], item.Points[i]) <= threshold)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (item.Tool == ToolMode.Rect)
+        {
+            return IsPointOnRectangle(point, NormalizeRect(item.Start, item.End), Math.Max(tolerance, itemWidth * 0.5f));
+        }
+
+        if (item.Tool == ToolMode.Ellipse)
+        {
+            return IsPointOnEllipse(point, NormalizeRect(item.Start, item.End), Math.Max(tolerance, itemWidth * 0.5f));
+        }
+
+        RectangleF bounds = GetItemBounds(item);
+        float hitPadding = item.Tool == ToolMode.Text ? tolerance : Math.Max(tolerance, itemWidth);
+        bounds.Inflate(hitPadding, hitPadding);
+        return bounds.Contains(point);
+    }
+
+    private static bool IsPointInFilledArrow(PointF point, AnnotationItem item, float itemWidth, float tolerance)
+    {
+        PointF[] points = BuildFilledArrowPoints(item, itemWidth);
+        if (points.Length == 0)
+        {
+            return false;
+        }
+
+        using (GraphicsPath path = new GraphicsPath())
+        using (Pen outlinePen = new Pen(Color.Black, Math.Max(1f, tolerance * 2f)))
+        {
+            path.AddPolygon(points);
+            return path.IsVisible(point) || path.IsOutlineVisible(point, outlinePen);
+        }
+    }
+
+    private static bool IsPointOnRectangle(PointF point, RectangleF rect, float tolerance)
+    {
+        if (rect.Width <= 0 || rect.Height <= 0)
+        {
+            return false;
+        }
+
+        RectangleF outer = rect;
+        outer.Inflate(tolerance, tolerance);
+        if (!outer.Contains(point))
+        {
+            return false;
+        }
+
+        RectangleF inner = rect;
+        inner.Inflate(-tolerance, -tolerance);
+        if (inner.Width <= 0 || inner.Height <= 0)
+        {
+            return true;
+        }
+        return !inner.Contains(point);
+    }
+
+    private static bool IsPointOnEllipse(PointF point, RectangleF rect, float tolerance)
+    {
+        if (rect.Width <= 0 || rect.Height <= 0)
+        {
+            return false;
+        }
+
+        using (GraphicsPath path = new GraphicsPath())
+        using (Pen pen = new Pen(Color.Black, Math.Max(1f, tolerance * 2f)))
+        {
+            path.AddEllipse(rect);
+            return path.IsOutlineVisible(point, pen);
+        }
+    }
+
+    private static float DistanceToSegment(PointF point, PointF a, PointF b)
+    {
+        float dx = b.X - a.X;
+        float dy = b.Y - a.Y;
+        float lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared <= 0.0001f)
+        {
+            return Distance(point, a);
+        }
+
+        float t = ((point.X - a.X) * dx + (point.Y - a.Y) * dy) / lengthSquared;
+        t = Math.Max(0f, Math.Min(1f, t));
+        PointF projection = new PointF(a.X + t * dx, a.Y + t * dy);
+        return Distance(point, projection);
+    }
+
+    private static void MoveAnnotation(AnnotationItem item, float dx, float dy)
+    {
+        item.MoveBy(dx, dy);
+    }
+
+    private PointF GetMoveOffset()
+    {
+        return new PointF(moveCurrentPoint.X - moveStartPoint.X, moveCurrentPoint.Y - moveStartPoint.Y);
+    }
+
+    private bool AppendPenPointIfNeeded(AnnotationItem item, PointF point, float threshold)
+    {
+        if (item == null)
+        {
+            return false;
+        }
+
+        if (item.Points.Count == 0)
+        {
+            item.AddPoint(point);
+            return true;
+        }
+
+        PointF last = item.Points[item.Points.Count - 1];
+        if (Distance(last, point) < threshold)
+        {
+            return false;
+        }
+
+        item.AddPoint(point);
+        return true;
+    }
+
     private void Canvas_MouseDown(object sender, MouseEventArgs e)
     {
         toolOptionsPanel.Visible = false;
@@ -639,6 +1496,7 @@ internal sealed partial class AnnotatorForm : Form
         {
             panning = true;
             drawing = false;
+            movingSelection = false;
             currentPenItem = null;
             lastPanPoint = e.Location;
             canvas.Cursor = Cursors.Hand;
@@ -653,6 +1511,39 @@ internal sealed partial class AnnotatorForm : Form
 
         startPoint = ToImagePoint(e.Location);
         currentPoint = startPoint;
+
+        if (inlineTextEditing)
+        {
+            if (IsPointInInlineTextInput(startPoint))
+            {
+                BeginInlineTextSelection(startPoint);
+                return;
+            }
+
+            HideInlineTextInput(true);
+        }
+
+        int hitIndex = HitTestAnnotation(startPoint);
+        if (hitIndex >= 0)
+        {
+            CommitInlineTextInput();
+            SelectAnnotation(hitIndex);
+            movingSelection = true;
+            selectionMoved = false;
+            moveStartPoint = startPoint;
+            moveCurrentPoint = startPoint;
+            lastMovePoint = startPoint;
+            drawing = false;
+            currentPenItem = null;
+            SuspendDisplayCacheForInteraction();
+            EnsureMoveBackgroundCache(GetView());
+            canvas.Cursor = Cursors.SizeAll;
+            canvas.Capture = true;
+            RequestCanvasRender();
+            return;
+        }
+
+        ClearSelection();
 
         if (currentTool == ToolMode.Text)
         {
@@ -670,7 +1561,7 @@ internal sealed partial class AnnotatorForm : Form
             currentPenItem.Tool = ToolMode.Pen;
             currentPenItem.StrokeColor = strokeColor;
             currentPenItem.StrokeWidth = strokeWidth;
-            currentPenItem.Points.Add(startPoint);
+            AppendPenPointIfNeeded(currentPenItem, startPoint, 0f);
         }
     }
 
@@ -683,10 +1574,15 @@ internal sealed partial class AnnotatorForm : Form
 
         textInputPosition = ToImagePoint(screenLocation);
         inlineText = string.Empty;
+        inlineCompositionText = string.Empty;
         inlineTextEditing = true;
+        inlineTextSelecting = false;
+        inlineTextSelectionAnchor = 0;
         inlineTextBox = CreateImeHostTextBox(screenLocation);
         inlineTextBox.KeyDown += InlineTextBox_KeyDown;
+        inlineTextBox.KeyUp += InlineTextBox_KeyUp;
         inlineTextBox.TextChanged += InlineTextBox_TextChanged;
+        inlineTextBox.CompositionChanged += InlineTextBox_CompositionChanged;
         canvas.Controls.Add(inlineTextBox);
         inlineTextBox.BringToFront();
         RestartInlineCaret();
@@ -703,7 +1599,9 @@ internal sealed partial class AnnotatorForm : Form
 
         string text = inlineTextBox == null ? (inlineText ?? string.Empty).Trim() : inlineTextBox.Text.Trim();
         inlineTextEditing = false;
+        inlineTextSelecting = false;
         inlineText = string.Empty;
+        inlineCompositionText = string.Empty;
         inlineCaretVisible = false;
         inlineCaretTimer.Stop();
         if (inlineTextBox != null)
@@ -711,7 +1609,9 @@ internal sealed partial class AnnotatorForm : Form
             try
             {
                 inlineTextBox.KeyDown -= InlineTextBox_KeyDown;
+                inlineTextBox.KeyUp -= InlineTextBox_KeyUp;
                 inlineTextBox.TextChanged -= InlineTextBox_TextChanged;
+                inlineTextBox.CompositionChanged -= InlineTextBox_CompositionChanged;
                 canvas.Controls.Remove(inlineTextBox);
                 inlineTextBox.Dispose();
             }
@@ -733,8 +1633,7 @@ internal sealed partial class AnnotatorForm : Form
             item.StrokeColor = strokeColor;
             item.StrokeWidth = strokeWidth;
             item.Text = text;
-            items.Add(item);
-            MarkAnnotationsChanged();
+            AddAnnotation(item);
         }
         if (!IsDisposed && canvas.IsHandleCreated)
         {
@@ -762,10 +1661,119 @@ internal sealed partial class AnnotatorForm : Form
         return true;
     }
 
-    private TextBox CreateImeHostTextBox(Point screenLocation)
+    private bool IsPointInInlineTextInput(PointF point)
+    {
+        RectangleF bounds = GetInlineTextInputBounds();
+        if (bounds.IsEmpty)
+        {
+            return false;
+        }
+
+        float tolerance = GetSelectionHitTolerance();
+        bounds.Inflate(tolerance, tolerance);
+        return bounds.Contains(point);
+    }
+
+    private RectangleF GetInlineTextInputBounds()
+    {
+        string text = inlineTextBox == null ? (inlineText ?? string.Empty) : inlineTextBox.Text;
+        string composition = inlineCompositionText ?? string.Empty;
+        float fontSize = Math.Max(1f, strokeWidth * 6f);
+        using (Graphics g = canvas.CreateGraphics())
+        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
+        using (StringFormat format = CreateInlineTextFormat())
+        {
+            float width = MeasureInlineEditingWidth(g, font, format, text, composition);
+            float height = MeasureInlineTextHeight(g, font, format);
+            return new RectangleF(textInputPosition.X, textInputPosition.Y, width, height);
+        }
+    }
+
+    private int GetInlineTextIndexAtPoint(PointF point)
+    {
+        string text = inlineTextBox == null ? (inlineText ?? string.Empty) : inlineTextBox.Text;
+        string composition = inlineCompositionText ?? string.Empty;
+        if (text.Length == 0)
+        {
+            return 0;
+        }
+
+        float localX = point.X - textInputPosition.X;
+        if (localX <= 0)
+        {
+            return 0;
+        }
+
+        float fontSize = Math.Max(1f, strokeWidth * 6f);
+        using (Graphics g = canvas.CreateGraphics())
+        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
+        using (StringFormat format = CreateInlineTextFormat())
+        {
+            if (composition.Length > 0)
+            {
+                int insertionIndex = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
+                float beforeWidth = MeasureInlineTextWidth(g, font, format, text, insertionIndex);
+                float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
+                if (localX >= beforeWidth && localX <= beforeWidth + compositionWidth)
+                {
+                    return insertionIndex;
+                }
+
+                if (localX > beforeWidth + compositionWidth)
+                {
+                    localX -= compositionWidth;
+                }
+            }
+
+            float previousWidth = 0f;
+            for (int i = 1; i <= text.Length; i++)
+            {
+                float width = MeasureInlineTextWidth(g, font, format, text, i);
+                if (localX <= (previousWidth + width) / 2f)
+                {
+                    return i - 1;
+                }
+                previousWidth = width;
+            }
+        }
+        return text.Length;
+    }
+
+    private void BeginInlineTextSelection(PointF point)
+    {
+        if (inlineTextBox == null)
+        {
+            return;
+        }
+
+        int index = GetInlineTextIndexAtPoint(point);
+        inlineTextSelectionAnchor = index;
+        inlineTextSelecting = true;
+        inlineTextBox.Select(index, 0);
+        inlineTextBox.Focus();
+        canvas.Cursor = Cursors.IBeam;
+        canvas.Capture = true;
+        SyncInlineTextInputState();
+    }
+
+    private void UpdateInlineTextSelection(PointF point)
+    {
+        if (inlineTextBox == null)
+        {
+            return;
+        }
+
+        int index = GetInlineTextIndexAtPoint(point);
+        int start = Math.Min(inlineTextSelectionAnchor, index);
+        int length = Math.Abs(index - inlineTextSelectionAnchor);
+        inlineTextBox.Select(start, length);
+        SyncInlineTextInputState();
+    }
+
+    private InlineImeTextBox CreateImeHostTextBox(Point screenLocation)
     {
         float fontSize = Math.Max(1f, strokeWidth * 6f);
-        var textBox = new TextBox();
+        var textBox = new InlineImeTextBox();
         textBox.Multiline = false;
         textBox.BorderStyle = BorderStyle.None;
         textBox.AutoSize = false;
@@ -781,12 +1789,50 @@ internal sealed partial class AnnotatorForm : Form
         return textBox;
     }
 
+    private int GetInlineSelectionStart()
+    {
+        return inlineTextBox == null ? 0 : inlineTextBox.SelectionStart;
+    }
+
+    private int GetInlineSelectionLength()
+    {
+        return inlineTextBox == null ? 0 : inlineTextBox.SelectionLength;
+    }
+
+    private int GetInlineCaretIndex()
+    {
+        if (inlineTextBox == null)
+        {
+            return (inlineText ?? string.Empty).Length;
+        }
+
+        return Math.Max(0, Math.Min(inlineTextBox.TextLength, inlineTextBox.SelectionStart + inlineTextBox.SelectionLength));
+    }
+
     private void InlineTextBox_KeyDown(object sender, KeyEventArgs e)
     {
-        HandleInlineTextKeyDown(e);
+        if (!HandleInlineTextKeyDown(e) && !IsDisposed && IsHandleCreated)
+        {
+            BeginInvoke((MethodInvoker)SyncInlineTextInputState);
+        }
+    }
+
+    private void InlineTextBox_KeyUp(object sender, KeyEventArgs e)
+    {
+        SyncInlineTextInputState();
     }
 
     private void InlineTextBox_TextChanged(object sender, EventArgs e)
+    {
+        SyncInlineTextInputState();
+    }
+
+    private void InlineTextBox_CompositionChanged(object sender, EventArgs e)
+    {
+        SyncInlineTextInputState();
+    }
+
+    private void SyncInlineTextInputState()
     {
         if (inlineTextBox == null)
         {
@@ -794,6 +1840,7 @@ internal sealed partial class AnnotatorForm : Form
         }
 
         inlineText = inlineTextBox.Text;
+        inlineCompositionText = inlineTextBox.CompositionText;
         PositionImeHostAtCaret();
         RestartInlineCaret();
         RequestCanvasRender();
@@ -818,13 +1865,26 @@ internal sealed partial class AnnotatorForm : Form
         float x = view.X + textInputPosition.X * scale;
         float y = view.Y + textInputPosition.Y * scale;
         string text = inlineText ?? string.Empty;
-        if (text.Length > 0)
+        string composition = inlineCompositionText ?? string.Empty;
+        int caretIndex = GetInlineCaretIndex();
+        if ((text.Length > 0 && caretIndex > 0) || composition.Length > 0)
         {
             using (Graphics g = canvas.CreateGraphics())
             using (Font font = new Font(AppStyles.UiFontName, Math.Max(1f, strokeWidth * 6f * scale), FontStyle.Bold))
-            using (StringFormat format = new StringFormat(StringFormat.GenericTypographic))
+            using (StringFormat format = CreateInlineTextFormat())
             {
-                x += g.MeasureString(text, font, int.MaxValue, format).Width;
+                if (composition.Length > 0)
+                {
+                    int selectionStart = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
+                    int selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, GetInlineSelectionLength()));
+                    int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
+                    x += MeasureInlineTextWidth(g, font, format, text, insertionIndex);
+                    x += MeasureInlineTextWidth(g, font, format, composition, composition.Length);
+                }
+                else
+                {
+                    x += MeasureInlineTextWidth(g, font, format, text, caretIndex);
+                }
             }
         }
         return new Point((int)Math.Round(x), (int)Math.Round(y));
@@ -843,6 +1903,15 @@ internal sealed partial class AnnotatorForm : Form
         {
             HideInlineTextInput(true);
             SaveAndClose();
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            return true;
+        }
+
+        if (e.Control && e.KeyCode == Keys.A && inlineTextBox != null)
+        {
+            inlineTextBox.SelectAll();
+            SyncInlineTextInputState();
             e.Handled = true;
             e.SuppressKeyPress = true;
             return true;
@@ -879,15 +1948,53 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
+        if (inlineTextSelecting)
+        {
+            UpdateInlineTextSelection(ToImagePoint(e.Location));
+            return;
+        }
+
+        if (movingSelection)
+        {
+            if (!HasSelectedItem())
+            {
+                ClearSelection();
+                canvas.Cursor = Cursors.Cross;
+                return;
+            }
+
+            PointF point = ToImagePoint(e.Location);
+            if (Distance(lastMovePoint, point) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels))
+            {
+                moveCurrentPoint = point;
+                lastMovePoint = point;
+                selectionMoved = Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
+                RequestCanvasRender();
+            }
+            return;
+        }
+
         if (!drawing)
         {
+            PointF point = ToImagePoint(e.Location);
+            if (inlineTextEditing && IsPointInInlineTextInput(point))
+            {
+                canvas.Cursor = Cursors.IBeam;
+                return;
+            }
+
+            canvas.Cursor = HitTestAnnotation(point) >= 0 ? Cursors.SizeAll : Cursors.Cross;
             return;
         }
 
         currentPoint = ToImagePoint(e.Location);
         if (currentTool == ToolMode.Pen && currentPenItem != null)
         {
-            currentPenItem.Points.Add(currentPoint);
+            if (AppendPenPointIfNeeded(currentPenItem, currentPoint, CanvasPixelsToImageDistance(PenSampleThresholdPixels)))
+            {
+                RequestCanvasRender();
+            }
+            return;
         }
         RequestCanvasRender();
     }
@@ -907,6 +2014,37 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
+        if (inlineTextSelecting)
+        {
+            inlineTextSelecting = false;
+            canvas.Capture = false;
+            canvas.Cursor = Cursors.IBeam;
+            if (inlineTextBox != null)
+            {
+                inlineTextBox.Focus();
+            }
+            RequestCanvasRender();
+            return;
+        }
+
+        if (movingSelection)
+        {
+            moveCurrentPoint = ToImagePoint(e.Location);
+            PointF offset = GetMoveOffset();
+            bool moved = selectionMoved || Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
+            if (moved && HasSelectedItem())
+            {
+                MoveAnnotation(items[selectedItemIndex], offset.X, offset.Y);
+            }
+            movingSelection = false;
+            canvas.Cursor = Cursors.Cross;
+            canvas.Capture = false;
+            ResumeDisplayCacheAfterInteraction(moved);
+            selectionMoved = false;
+            RequestCanvasRender();
+            return;
+        }
+
         if (!drawing)
         {
             return;
@@ -917,10 +2055,10 @@ internal sealed partial class AnnotatorForm : Form
         currentPoint = ToImagePoint(e.Location);
         if (currentTool == ToolMode.Pen)
         {
+            AppendPenPointIfNeeded(currentPenItem, currentPoint, 0.01f);
             if (currentPenItem != null && IsMeaningfulAnnotation(currentPenItem))
             {
-                items.Add(currentPenItem);
-                MarkAnnotationsChanged();
+                AddAnnotation(currentPenItem);
             }
         }
         else
@@ -933,8 +2071,7 @@ internal sealed partial class AnnotatorForm : Form
             item.StrokeWidth = strokeWidth;
             if (IsMeaningfulAnnotation(item))
             {
-                items.Add(item);
-                MarkAnnotationsChanged();
+                AddAnnotation(item);
             }
         }
         currentPenItem = null;
@@ -948,14 +2085,17 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
-        if (e.Control && e.KeyCode == Keys.Z)
+        if (e.KeyCode == Keys.Delete || e.KeyCode == Keys.Back)
         {
-            if (items.Count > 0)
+            if (DeleteSelectedAnnotation())
             {
-                items.RemoveAt(items.Count - 1);
-                MarkAnnotationsChanged();
-                RequestCanvasRender();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
             }
+        }
+        else if (e.Control && e.KeyCode == Keys.Z)
+        {
+            UndoAnnotationAction();
         }
         else if (e.Control && e.KeyCode == Keys.S)
         {
@@ -1122,14 +2262,7 @@ internal static class Program
 
     private static void RunSelfTest()
     {
-        using (var bmp = new Bitmap(32, 32))
-        using (Graphics g = Graphics.FromImage(bmp))
-        using (var pen = new Pen(Color.Red, 2f))
-        using (var cap = new AdjustableArrowCap(7f, 9f, true))
-        {
-            pen.CustomEndCap = cap;
-            g.DrawLine(pen, new PointF(2, 2), new PointF(30, 30));
-        }
+        AssertGraphicsTransformOrder();
 
         AssertMeaningful(new AnnotationItem
         {
@@ -1154,10 +2287,38 @@ internal static class Program
 
         var penItem = new AnnotationItem();
         penItem.Tool = ToolMode.Pen;
-        penItem.Points.Add(new PointF(10, 10));
+        penItem.AddPoint(new PointF(10, 10));
         AssertMeaningful(penItem, false);
-        penItem.Points.Add(new PointF(20, 20));
+        penItem.AddPoint(new PointF(20, 20));
         AssertMeaningful(penItem, true);
+    }
+
+    private static void AssertGraphicsTransformOrder()
+    {
+        using (var bitmap = new Bitmap(1, 1))
+        using (Graphics g = Graphics.FromImage(bitmap))
+        {
+            g.TranslateTransform(100f, 50f, MatrixOrder.Prepend);
+            g.ScaleTransform(2f, 2f, MatrixOrder.Prepend);
+            g.TranslateTransform(3f, 4f, MatrixOrder.Prepend);
+
+            PointF[] point = new PointF[] { new PointF(10f, 20f) };
+            using (Matrix transform = g.Transform)
+            {
+                transform.TransformPoints(point);
+            }
+
+            AssertNear(point[0].X, 126f, "GDI+ transform x");
+            AssertNear(point[0].Y, 98f, "GDI+ transform y");
+        }
+    }
+
+    private static void AssertNear(float actual, float expected, string label)
+    {
+        if (Math.Abs(actual - expected) > 0.001f)
+        {
+            throw new InvalidOperationException(label + " self test failed.");
+        }
     }
 
     private static void AssertMeaningful(AnnotationItem item, bool expected)
