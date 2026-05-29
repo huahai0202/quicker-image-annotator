@@ -9,6 +9,7 @@ using System.Windows.Forms;
 internal sealed partial class AnnotatorForm : Form
 {
     private readonly string imagePath;
+    private string outputDirectory;
     private readonly Bitmap baseImage;
     private readonly List<AnnotationItem> items = new List<AnnotationItem>();
     private readonly ModernToolbarPanel toolbar = new ModernToolbarPanel();
@@ -111,9 +112,10 @@ internal sealed partial class AnnotatorForm : Form
         }
     }
 
-    public AnnotatorForm(string path, Bitmap image)
+    public AnnotatorForm(string path, Bitmap image, string outputDirectory)
     {
         imagePath = path;
+        this.outputDirectory = outputDirectory;
         baseImage = image;
         canvasRenderScheduler = new AnimationFrameScheduler(InvalidateCanvasNow);
         imePositionThrottle = AppUtilities.Throttle(PositionImeHostAtCaret, AppStyles.AnimationFrameMilliseconds);
@@ -1593,7 +1595,7 @@ internal sealed partial class AnnotatorForm : Form
 
             using (Bitmap result = RenderFinalImage())
             {
-                string outputPath = GetAnnotatedOutputPath(imagePath);
+                string outputPath = GetAnnotatedOutputPath(imagePath, outputDirectory);
                 SaveBitmap(result, outputPath);
                 Clipboard.SetImage((Bitmap)result.Clone());
             }
@@ -1623,13 +1625,18 @@ internal sealed partial class AnnotatorForm : Form
         File.Move(tempPath, path);
     }
 
-    private static string GetAnnotatedOutputPath(string path)
+    private static string GetAnnotatedOutputPath(string path, string outputDirectory)
     {
-        string dir = Path.GetDirectoryName(path);
+        string dir = outputDirectory;
+        if (string.IsNullOrEmpty(dir))
+        {
+            dir = Path.GetDirectoryName(path);
+        }
         if (string.IsNullOrEmpty(dir))
         {
             dir = Environment.CurrentDirectory;
         }
+        Directory.CreateDirectory(dir);
 
         string name = Path.GetFileNameWithoutExtension(path);
         string ext = Path.GetExtension(path);
@@ -1651,6 +1658,8 @@ internal sealed partial class AnnotatorForm : Form
 
 internal static class Program
 {
+    private const string OutputDirectoryEnvironmentVariable = "QUICKER_ANNOTATOR_OUTPUT_DIR";
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -1665,9 +1674,11 @@ internal static class Program
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            string path = CaptureService.GetInputImagePath(args);
+            string outputDirectory = GetConfiguredOutputDirectory(args);
+            string[] inputArgs = GetInputArgs(args);
+            string path = CaptureService.GetInputImagePath(inputArgs);
             using (Bitmap image = CaptureService.LoadBitmap(path))
-            using (var form = new AnnotatorForm(path, (Bitmap)image.Clone()))
+            using (var form = new AnnotatorForm(path, (Bitmap)image.Clone(), outputDirectory))
             {
                 AppLog.Info("Starting annotator window.");
                 Application.Run(form);
@@ -1680,6 +1691,98 @@ internal static class Program
             MessageBox.Show(ex.Message, "图片标注", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
+    }
+
+    private static string GetConfiguredOutputDirectory(string[] args)
+    {
+        string outputDirectory = AppSettingsStore.Load().OutputDirectory;
+        string environmentDirectory = Environment.GetEnvironmentVariable(OutputDirectoryEnvironmentVariable);
+        if (!string.IsNullOrWhiteSpace(environmentDirectory))
+        {
+            outputDirectory = environmentDirectory;
+        }
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            string arg = args[i];
+            string inlineValue;
+            if (TryGetInlineOutputDirectory(arg, out inlineValue))
+            {
+                outputDirectory = inlineValue;
+            }
+            else if (IsOutputDirectoryOption(arg))
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw new ArgumentException("--output-dir requires a directory path.");
+                }
+
+                outputDirectory = args[++i];
+            }
+        }
+
+        return NormalizeOutputDirectory(outputDirectory);
+    }
+
+    private static string[] GetInputArgs(string[] args)
+    {
+        var inputArgs = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string arg = args[i];
+            string ignoredValue;
+            if (TryGetInlineOutputDirectory(arg, out ignoredValue))
+            {
+                continue;
+            }
+            if (IsOutputDirectoryOption(arg))
+            {
+                i++;
+                continue;
+            }
+
+            inputArgs.Add(arg);
+        }
+
+        return inputArgs.ToArray();
+    }
+
+    private static bool TryGetInlineOutputDirectory(string arg, out string outputDirectory)
+    {
+        outputDirectory = null;
+        string[] prefixes = new string[]
+        {
+            "--output-dir=",
+            "--output-dir:",
+            "-output-dir=",
+            "-output-dir:",
+            "/output-dir=",
+            "/output-dir:"
+        };
+
+        for (int i = 0; i < prefixes.Length; i++)
+        {
+            string prefix = prefixes[i];
+            if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                outputDirectory = arg.Substring(prefix.Length);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsOutputDirectoryOption(string arg)
+    {
+        return string.Equals(arg, "--output-dir", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "-output-dir", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "/output-dir", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeOutputDirectory(string outputDirectory)
+    {
+        return AppSettingsStore.NormalizeDirectory(outputDirectory);
     }
 
     private static void RunSelfTest()

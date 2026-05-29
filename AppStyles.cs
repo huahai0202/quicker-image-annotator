@@ -44,10 +44,10 @@ internal static class AppStyles
     public static readonly int[] StrokeWidths = new int[] { 2, 4, 8, 12 };
 
     public const int ToolbarHeight = 82;
-    public const int ToolbarStartX = 32;
+    public const int ToolbarStartX = 24;
     public const int ToolbarButtonTop = 23;
     public const int ToolbarButtonSize = 36;
-    public const int ToolbarButtonGap = 8;
+    public const int ToolbarButtonGap = 6;
     public const int ToolbarSeparatorTop = 27;
     public const int ToolbarSeparatorHeight = 28;
     public const int ToolOptionsWidth = 346;

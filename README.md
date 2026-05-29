@@ -32,6 +32,15 @@
 .\AnnotatorApp.exe "C:\path\to\image.png"
 ```
 
+如果希望所有标注结果都保存到固定目录，可以传入输出目录：
+
+```powershell
+.\AnnotatorApp.exe --output-dir "D:\AnnotatedImages"
+.\AnnotatorApp.exe "C:\path\to\image.png" --output-dir "D:\AnnotatedImages"
+```
+
+也可以点击工具栏上的设置按钮选择固定保存目录，或设置环境变量 `QUICKER_ANNOTATOR_OUTPUT_DIR`。命令行参数和环境变量会优先于工具栏设置；未设置时仍保存到原图片所在目录。
+
 常用快捷键：
 
 - `Ctrl+S`：保存并关闭。

@@ -44,6 +44,11 @@ internal sealed partial class AnnotatorForm
             CommitInlineTextInput();
             ToggleTopMost();
         });
+        AddActionButton(ref toolbarX, ToolbarIconKind.Settings, "设置", delegate
+        {
+            CommitInlineTextInput();
+            ShowSettingsDialog();
+        });
         AddToolbarSeparator(ref toolbarX);
         AddActionButton(ref toolbarX, ToolbarIconKind.Cancel, "取消", delegate { Close(); });
         AddActionButton(ref toolbarX, ToolbarIconKind.Save, "保存", delegate { SaveAndClose(); });
@@ -109,6 +114,34 @@ internal sealed partial class AnnotatorForm
         topMostButton.Selected = TopMost;
         toolbarToolTip.SetToolTip(topMostButton, TopMost ? "取消置顶" : "固定置顶");
         topMostButton.Invalidate();
+    }
+
+    private void ShowSettingsDialog()
+    {
+        toolOptionsPanel.Visible = false;
+        using (var dialog = new SettingsDialog(outputDirectory))
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            var settings = new AppSettings
+            {
+                OutputDirectory = dialog.OutputDirectory
+            };
+            try
+            {
+                AppSettingsStore.Save(settings);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "图片标注", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            outputDirectory = settings.OutputDirectory;
+        }
     }
 
     private ModernIconButton CreateToolbarButton(ToolbarIconKind iconKind, string tooltip)

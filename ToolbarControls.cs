@@ -40,6 +40,7 @@ internal enum ToolbarIconKind
     Clear,
     Fit,
     Pin,
+    Settings,
     Save,
     Cancel
 }
@@ -321,6 +322,21 @@ internal sealed class ModernIconButton : Button
                     g.DrawLine(pen, cx - 5, cy - 4, cx, cy + 2);
                     g.DrawLine(pen, cx + 5, cy - 4, cx, cy + 2);
                     g.DrawLine(pen, cx, cy + 2, cx, cy + 11);
+                    break;
+
+                case ToolbarIconKind.Settings:
+                    pen.Width = 1.9f;
+                    for (int i = 0; i < 8; i++)
+                    {
+                        double angle = Math.PI * 2d * i / 8d;
+                        float x1 = cx + (float)Math.Cos(angle) * 8.2f;
+                        float y1 = cy + (float)Math.Sin(angle) * 8.2f;
+                        float x2 = cx + (float)Math.Cos(angle) * 11f;
+                        float y2 = cy + (float)Math.Sin(angle) * 11f;
+                        g.DrawLine(pen, x1, y1, x2, y2);
+                    }
+                    g.DrawEllipse(pen, cx - 7, cy - 7, 14, 14);
+                    g.DrawEllipse(pen, cx - 2, cy - 2, 4, 4);
                     break;
 
                 case ToolbarIconKind.Save:
