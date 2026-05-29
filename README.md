@@ -54,6 +54,12 @@ powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1
 powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -SelfTest
 ```
 
+x64 构建：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x64 -SelfTest
+```
+
 ## 发布
 
-Release 资产包含可直接运行的 `AnnotatorApp.exe`。源码包由 GitHub Releases 自动附带。
+Release 资产包含可直接运行的 `AnnotatorApp.exe`，以及显式 x64 构建的 `AnnotatorApp-x64.exe`。源码包由 GitHub Releases 自动附带。

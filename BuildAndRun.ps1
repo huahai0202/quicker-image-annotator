@@ -1,4 +1,7 @@
 param(
+    [ValidateSet("anycpu", "x64", "x86")]
+    [string]$Platform = "anycpu",
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArgs
 )
@@ -6,7 +9,9 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sources = @(Get-ChildItem -LiteralPath $root -Filter "*.cs" | Sort-Object Name)
-$exe = Join-Path $root "AnnotatorApp.exe"
+$platformName = $Platform.ToLowerInvariant()
+$exeName = if ($platformName -eq "anycpu") { "AnnotatorApp.exe" } else { "AnnotatorApp-$platformName.exe" }
+$exe = Join-Path $root $exeName
 $icon = Join-Path $root "AppIcon.ico"
 
 $candidates = @(
@@ -39,11 +44,15 @@ if (-not $needsBuild) {
 if (-not $needsBuild -and (Test-Path -LiteralPath $icon)) {
     $needsBuild = (Get-Item -LiteralPath $icon).LastWriteTimeUtc -gt (Get-Item -LiteralPath $exe).LastWriteTimeUtc
 }
+if (-not $needsBuild) {
+    $needsBuild = (Get-Item -LiteralPath $MyInvocation.MyCommand.Path).LastWriteTimeUtc -gt (Get-Item -LiteralPath $exe).LastWriteTimeUtc
+}
 
 if ($needsBuild) {
     $compileArgs = @(
         "/nologo",
         "/target:winexe",
+        "/platform:$platformName",
         "/optimize+",
         "/out:$exe",
         "/r:System.Windows.Forms.dll",
@@ -59,9 +68,15 @@ if ($needsBuild) {
     }
 }
 
+if ($RemainingArgs -contains "-SelfTest") {
+    $process = Start-Process -FilePath $exe -ArgumentList $RemainingArgs -Wait -PassThru -WindowStyle Hidden
+    $code = $process.ExitCode
+    if ($code -eq 0) {
+        Write-Output "OK"
+    }
+    exit $code
+}
+
 & $exe @RemainingArgs
 $code = $LASTEXITCODE
-if (($RemainingArgs -contains "-SelfTest") -and $code -eq 0) {
-    Write-Output "OK"
-}
 exit $code
