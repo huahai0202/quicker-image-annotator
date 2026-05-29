@@ -28,6 +28,16 @@ internal sealed class AnnotationItem
         drawingPointsCache = null;
     }
 
+    public void SetPoints(IEnumerable<PointF> points)
+    {
+        Points.Clear();
+        if (points != null)
+        {
+            Points.AddRange(points);
+        }
+        drawingPointsCache = null;
+    }
+
     public PointF[] GetDrawingPoints()
     {
         if (drawingPointsCache == null || drawingPointsCache.Length != Points.Count)

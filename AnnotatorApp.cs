@@ -31,10 +31,14 @@ internal sealed partial class AnnotatorForm : Form
     private AnnotationItem currentPenItem;
     private int selectedItemIndex = -1;
     private bool movingSelection;
+    private bool resizingSelection;
+    private SelectionHandle activeSelectionHandle = SelectionHandle.None;
     private PointF lastMovePoint;
     private PointF moveStartPoint;
     private PointF moveCurrentPoint;
     private bool selectionMoved;
+    private AnnotationSnapshot selectionEditStartState;
+    private RectangleF selectionEditStartBounds;
     private Bitmap displayCache;
     private Size displayCacheSize = Size.Empty;
     private Bitmap moveBackgroundCache;
@@ -68,7 +72,32 @@ internal sealed partial class AnnotatorForm : Form
     private enum AnnotationUndoKind
     {
         Add,
-        Delete
+        Delete,
+        Transform
+    }
+
+    private enum SelectionHandle
+    {
+        None,
+        TopLeft,
+        Top,
+        TopRight,
+        Right,
+        BottomRight,
+        Bottom,
+        BottomLeft,
+        Left
+    }
+
+    private sealed class AnnotationSnapshot
+    {
+        public ToolMode Tool;
+        public PointF Start;
+        public PointF End;
+        public Color StrokeColor;
+        public float StrokeWidth;
+        public PointF[] Points = new PointF[0];
+        public string Text;
     }
 
     private sealed class AnnotationUndoAction
@@ -76,12 +105,19 @@ internal sealed partial class AnnotatorForm : Form
         public readonly AnnotationUndoKind Kind;
         public readonly AnnotationItem Item;
         public readonly int Index;
+        public readonly AnnotationSnapshot Before;
 
         public AnnotationUndoAction(AnnotationUndoKind kind, AnnotationItem item, int index)
+            : this(kind, item, index, null)
+        {
+        }
+
+        public AnnotationUndoAction(AnnotationUndoKind kind, AnnotationItem item, int index, AnnotationSnapshot before)
         {
             Kind = kind;
             Item = item;
             Index = index;
+            Before = before;
         }
     }
 
@@ -550,8 +586,9 @@ internal sealed partial class AnnotatorForm : Form
         int viewX = (int)Math.Round(view.X);
         int viewY = (int)Math.Round(view.Y);
         float scale = view.Width / baseImage.Width;
+        bool editingSelection = IsEditingSelection();
         bool drewMovingBackground = false;
-        if (movingSelection && HasSelectedItem())
+        if (editingSelection)
         {
             EnsureMoveBackgroundCache(view);
             if (moveBackgroundCache != null)
@@ -575,7 +612,7 @@ internal sealed partial class AnnotatorForm : Form
             GraphicsState slowState = e.Graphics.Save();
             e.Graphics.TranslateTransform(viewX, viewY, MatrixOrder.Prepend);
             e.Graphics.ScaleTransform(scale, scale, MatrixOrder.Prepend);
-            DrawAnnotations(e.Graphics, scale, movingSelection ? selectedItemIndex : -1);
+            DrawAnnotations(e.Graphics, scale, editingSelection ? selectedItemIndex : -1);
             e.Graphics.Restore(slowState);
         }
 
@@ -601,15 +638,14 @@ internal sealed partial class AnnotatorForm : Form
             }
         }
 
-        if (movingSelection && HasSelectedItem())
+        if (editingSelection)
         {
-            GraphicsState moveState = e.Graphics.Save();
-            PointF offset = GetMoveOffset();
-            // Prepend keeps the move offset in image coordinates under the current view scale.
-            e.Graphics.TranslateTransform(offset.X, offset.Y, MatrixOrder.Prepend);
-            DrawItem(e.Graphics, items[selectedItemIndex], scale);
-            DrawSelection(e.Graphics, items[selectedItemIndex], scale);
-            e.Graphics.Restore(moveState);
+            AnnotationItem preview = GetSelectionPreviewItem();
+            if (preview != null)
+            {
+                DrawItem(e.Graphics, preview, scale);
+                DrawSelection(e.Graphics, preview, scale);
+            }
         }
         else if (HasSelectedItem())
         {
@@ -757,16 +793,13 @@ internal sealed partial class AnnotatorForm : Form
 
     private void DrawSelection(Graphics g, AnnotationItem item, float scale)
     {
-        RectangleF bounds = GetItemBounds(item);
+        RectangleF bounds = GetSelectionFrameBounds(item, scale);
         if (bounds.IsEmpty)
         {
             return;
         }
 
         float safeScale = Math.Max(0.001f, scale);
-        float padding = Math.Max(2f, 4f / safeScale);
-        bounds.Inflate(padding, padding);
-
         float lineWidth = Math.Max(0.1f, 1.25f / safeScale);
         using (Pen pen = new Pen(AppStyles.OptionSelectedForeground, lineWidth))
         using (Brush handleBrush = new SolidBrush(Color.White))
@@ -775,19 +808,159 @@ internal sealed partial class AnnotatorForm : Form
             pen.DashStyle = DashStyle.Dash;
             g.DrawRectangle(pen, bounds.X, bounds.Y, bounds.Width, bounds.Height);
 
-            float handleSize = Math.Max(2.5f, 6f / safeScale);
+            if (!CanResizeAnnotation(item))
+            {
+                return;
+            }
+
+            float handleSize = Math.Max(3f, 7f / safeScale);
             DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Top, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left + bounds.Width / 2f, bounds.Top, handleSize);
             DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Top, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Top + bounds.Height / 2f, handleSize);
             DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Bottom, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left + bounds.Width / 2f, bounds.Bottom, handleSize);
             DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Bottom, handleSize);
+            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Top + bounds.Height / 2f, handleSize);
         }
     }
 
     private static void DrawSelectionHandle(Graphics g, Brush brush, Pen pen, float x, float y, float size)
     {
         RectangleF rect = new RectangleF(x - size / 2f, y - size / 2f, size, size);
-        g.FillRectangle(brush, rect);
-        g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+        g.FillEllipse(brush, rect);
+        g.DrawEllipse(pen, rect);
+    }
+
+    private RectangleF GetSelectionFrameBounds(AnnotationItem item)
+    {
+        return GetSelectionFrameBounds(item, GetScale());
+    }
+
+    private RectangleF GetSelectionFrameBounds(AnnotationItem item, float scale)
+    {
+        RectangleF bounds = GetItemBounds(item);
+        if (bounds.IsEmpty)
+        {
+            return bounds;
+        }
+
+        float safeScale = Math.Max(0.001f, scale);
+        float padding = Math.Max(2f, 4f / safeScale);
+        bounds.Inflate(padding, padding);
+        return bounds;
+    }
+
+    private static bool CanResizeAnnotation(AnnotationItem item)
+    {
+        return item != null && item.Tool != ToolMode.Text;
+    }
+
+    private SelectionHandle HitTestSelectionHandle(PointF point)
+    {
+        if (!HasSelectedItem())
+        {
+            return SelectionHandle.None;
+        }
+
+        AnnotationItem item = items[selectedItemIndex];
+        if (!CanResizeAnnotation(item))
+        {
+            return SelectionHandle.None;
+        }
+
+        RectangleF bounds = GetSelectionFrameBounds(item);
+        if (bounds.IsEmpty)
+        {
+            return SelectionHandle.None;
+        }
+
+        float radius = GetSelectionHandleHitRadius();
+        SelectionHandle[] handles = new SelectionHandle[]
+        {
+            SelectionHandle.TopLeft,
+            SelectionHandle.TopRight,
+            SelectionHandle.BottomRight,
+            SelectionHandle.BottomLeft,
+            SelectionHandle.Top,
+            SelectionHandle.Right,
+            SelectionHandle.Bottom,
+            SelectionHandle.Left
+        };
+
+        for (int i = 0; i < handles.Length; i++)
+        {
+            if (IsPointInSelectionHandle(point, GetSelectionHandlePoint(bounds, handles[i]), radius))
+            {
+                return handles[i];
+            }
+        }
+
+        return SelectionHandle.None;
+    }
+
+    private float GetSelectionHandleHitRadius()
+    {
+        float scale = GetScale();
+        if (scale <= 0)
+        {
+            return 8f;
+        }
+
+        return Math.Max(4f, 8f / scale);
+    }
+
+    private static bool IsPointInSelectionHandle(PointF point, PointF handlePoint, float radius)
+    {
+        float dx = point.X - handlePoint.X;
+        float dy = point.Y - handlePoint.Y;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    private static PointF GetSelectionHandlePoint(RectangleF bounds, SelectionHandle handle)
+    {
+        switch (handle)
+        {
+            case SelectionHandle.TopLeft:
+                return new PointF(bounds.Left, bounds.Top);
+            case SelectionHandle.Top:
+                return new PointF(bounds.Left + bounds.Width / 2f, bounds.Top);
+            case SelectionHandle.TopRight:
+                return new PointF(bounds.Right, bounds.Top);
+            case SelectionHandle.Right:
+                return new PointF(bounds.Right, bounds.Top + bounds.Height / 2f);
+            case SelectionHandle.BottomRight:
+                return new PointF(bounds.Right, bounds.Bottom);
+            case SelectionHandle.Bottom:
+                return new PointF(bounds.Left + bounds.Width / 2f, bounds.Bottom);
+            case SelectionHandle.BottomLeft:
+                return new PointF(bounds.Left, bounds.Bottom);
+            case SelectionHandle.Left:
+                return new PointF(bounds.Left, bounds.Top + bounds.Height / 2f);
+            default:
+                return PointF.Empty;
+        }
+    }
+
+    private static Cursor GetSelectionHandleCursor(SelectionHandle handle)
+    {
+        switch (handle)
+        {
+            case SelectionHandle.TopLeft:
+            case SelectionHandle.BottomRight:
+                return Cursors.SizeNWSE;
+            case SelectionHandle.TopRight:
+            case SelectionHandle.BottomLeft:
+                return Cursors.SizeNESW;
+            case SelectionHandle.Top:
+            case SelectionHandle.Bottom:
+                return Cursors.SizeNS;
+            case SelectionHandle.Left:
+            case SelectionHandle.Right:
+                return Cursors.SizeWE;
+            default:
+                return Cursors.Cross;
+        }
     }
 
     private RectangleF GetItemBounds(AnnotationItem item)
@@ -1182,6 +1355,256 @@ internal sealed partial class AnnotatorForm : Form
         return (float)Math.Sqrt(dx * dx + dy * dy);
     }
 
+    private bool IsEditingSelection()
+    {
+        return HasSelectedItem() && (movingSelection || resizingSelection);
+    }
+
+    private AnnotationItem GetSelectionPreviewItem()
+    {
+        if (!HasSelectedItem())
+        {
+            return null;
+        }
+
+        AnnotationSnapshot snapshot = selectionEditStartState ?? CaptureAnnotation(items[selectedItemIndex]);
+        AnnotationItem preview = CreateAnnotationItem(snapshot);
+        PointF offset = GetMoveOffset();
+        if (movingSelection)
+        {
+            preview.MoveBy(offset.X, offset.Y);
+        }
+        else if (resizingSelection)
+        {
+            ApplyResizeToAnnotation(preview, snapshot, selectionEditStartBounds, activeSelectionHandle, offset);
+        }
+        return preview;
+    }
+
+    private static AnnotationSnapshot CaptureAnnotation(AnnotationItem item)
+    {
+        if (item == null)
+        {
+            return null;
+        }
+
+        return new AnnotationSnapshot
+        {
+            Tool = item.Tool,
+            Start = item.Start,
+            End = item.End,
+            StrokeColor = item.StrokeColor,
+            StrokeWidth = item.StrokeWidth,
+            Points = item.Points.ToArray(),
+            Text = item.Text
+        };
+    }
+
+    private static AnnotationItem CreateAnnotationItem(AnnotationSnapshot snapshot)
+    {
+        if (snapshot == null)
+        {
+            return null;
+        }
+
+        var item = new AnnotationItem();
+        ApplyAnnotationSnapshot(item, snapshot);
+        return item;
+    }
+
+    private static void ApplyAnnotationSnapshot(AnnotationItem item, AnnotationSnapshot snapshot)
+    {
+        if (item == null || snapshot == null)
+        {
+            return;
+        }
+
+        item.Tool = snapshot.Tool;
+        item.Start = snapshot.Start;
+        item.End = snapshot.End;
+        item.StrokeColor = snapshot.StrokeColor;
+        item.StrokeWidth = snapshot.StrokeWidth;
+        item.Text = snapshot.Text;
+        item.SetPoints(snapshot.Points);
+    }
+
+    private bool RecordTransformUndo(AnnotationItem item, int index, AnnotationSnapshot before, AnnotationSnapshot after)
+    {
+        if (item == null || before == null || after == null || AnnotationSnapshotsEqual(before, after))
+        {
+            return false;
+        }
+
+        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Transform, item, index, before));
+        MarkAnnotationsChanged();
+        return true;
+    }
+
+    private static bool AnnotationSnapshotsEqual(AnnotationSnapshot a, AnnotationSnapshot b)
+    {
+        if (a == null || b == null)
+        {
+            return a == b;
+        }
+
+        if (a.Tool != b.Tool ||
+            !SamePoint(a.Start, b.Start) ||
+            !SamePoint(a.End, b.End) ||
+            a.StrokeColor.ToArgb() != b.StrokeColor.ToArgb() ||
+            Math.Abs(a.StrokeWidth - b.StrokeWidth) > 0.001f ||
+            !string.Equals(a.Text ?? string.Empty, b.Text ?? string.Empty, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        PointF[] aPoints = a.Points ?? new PointF[0];
+        PointF[] bPoints = b.Points ?? new PointF[0];
+        if (aPoints.Length != bPoints.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < aPoints.Length; i++)
+        {
+            if (!SamePoint(aPoints[i], bPoints[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool SamePoint(PointF a, PointF b)
+    {
+        return Math.Abs(a.X - b.X) <= 0.001f && Math.Abs(a.Y - b.Y) <= 0.001f;
+    }
+
+    private static void ApplyResizeToAnnotation(AnnotationItem item, AnnotationSnapshot originalState, RectangleF originalBounds, SelectionHandle handle, PointF offset)
+    {
+        if (item == null || originalState == null || handle == SelectionHandle.None || originalBounds.IsEmpty)
+        {
+            return;
+        }
+
+        ApplyAnnotationSnapshot(item, originalState);
+        RectangleF targetBounds = GetResizedBounds(originalBounds, handle, offset);
+        TransformAnnotationToBounds(item, originalBounds, targetBounds);
+    }
+
+    private static RectangleF GetResizedBounds(RectangleF originalBounds, SelectionHandle handle, PointF offset)
+    {
+        float left = originalBounds.Left;
+        float top = originalBounds.Top;
+        float right = originalBounds.Right;
+        float bottom = originalBounds.Bottom;
+
+        if (HandleAffectsLeft(handle))
+        {
+            left += offset.X;
+        }
+        if (HandleAffectsRight(handle))
+        {
+            right += offset.X;
+        }
+        if (HandleAffectsTop(handle))
+        {
+            top += offset.Y;
+        }
+        if (HandleAffectsBottom(handle))
+        {
+            bottom += offset.Y;
+        }
+
+        if (right - left < MinAnnotationExtent)
+        {
+            if (HandleAffectsLeft(handle))
+            {
+                left = right - MinAnnotationExtent;
+            }
+            else
+            {
+                right = left + MinAnnotationExtent;
+            }
+        }
+
+        if (bottom - top < MinAnnotationExtent)
+        {
+            if (HandleAffectsTop(handle))
+            {
+                top = bottom - MinAnnotationExtent;
+            }
+            else
+            {
+                bottom = top + MinAnnotationExtent;
+            }
+        }
+
+        return RectangleF.FromLTRB(left, top, right, bottom);
+    }
+
+    private static bool HandleAffectsLeft(SelectionHandle handle)
+    {
+        return handle == SelectionHandle.TopLeft || handle == SelectionHandle.BottomLeft || handle == SelectionHandle.Left;
+    }
+
+    private static bool HandleAffectsRight(SelectionHandle handle)
+    {
+        return handle == SelectionHandle.TopRight || handle == SelectionHandle.BottomRight || handle == SelectionHandle.Right;
+    }
+
+    private static bool HandleAffectsTop(SelectionHandle handle)
+    {
+        return handle == SelectionHandle.TopLeft || handle == SelectionHandle.TopRight || handle == SelectionHandle.Top;
+    }
+
+    private static bool HandleAffectsBottom(SelectionHandle handle)
+    {
+        return handle == SelectionHandle.BottomLeft || handle == SelectionHandle.BottomRight || handle == SelectionHandle.Bottom;
+    }
+
+    private static void TransformAnnotationToBounds(AnnotationItem item, RectangleF sourceBounds, RectangleF targetBounds)
+    {
+        if (item.Tool == ToolMode.Rect || item.Tool == ToolMode.Ellipse || item.Tool == ToolMode.Mosaic)
+        {
+            item.Start = new PointF(targetBounds.Left, targetBounds.Top);
+            item.End = new PointF(targetBounds.Right, targetBounds.Bottom);
+            return;
+        }
+
+        item.Start = TransformPointToBounds(item.Start, sourceBounds, targetBounds);
+        item.End = TransformPointToBounds(item.End, sourceBounds, targetBounds);
+
+        if (item.Points.Count > 0)
+        {
+            PointF[] points = new PointF[item.Points.Count];
+            for (int i = 0; i < item.Points.Count; i++)
+            {
+                points[i] = TransformPointToBounds(item.Points[i], sourceBounds, targetBounds);
+            }
+            item.SetPoints(points);
+        }
+    }
+
+    private static PointF TransformPointToBounds(PointF point, RectangleF sourceBounds, RectangleF targetBounds)
+    {
+        float xRatio = sourceBounds.Width <= 0.0001f ? 0.5f : (point.X - sourceBounds.Left) / sourceBounds.Width;
+        float yRatio = sourceBounds.Height <= 0.0001f ? 0.5f : (point.Y - sourceBounds.Top) / sourceBounds.Height;
+        return new PointF(
+            targetBounds.Left + xRatio * targetBounds.Width,
+            targetBounds.Top + yRatio * targetBounds.Height);
+    }
+
+    private void ResetSelectionEditState()
+    {
+        movingSelection = false;
+        resizingSelection = false;
+        activeSelectionHandle = SelectionHandle.None;
+        selectionMoved = false;
+        selectionEditStartState = null;
+        selectionEditStartBounds = RectangleF.Empty;
+    }
+
     private bool HasSelectedItem()
     {
         return selectedItemIndex >= 0 && selectedItemIndex < items.Count;
@@ -1189,12 +1612,11 @@ internal sealed partial class AnnotatorForm : Form
 
     private void ClearSelection()
     {
-        bool wasMoving = movingSelection;
+        bool wasEditing = movingSelection || resizingSelection;
         bool moved = selectionMoved;
         selectedItemIndex = -1;
-        movingSelection = false;
-        selectionMoved = false;
-        if (wasMoving)
+        ResetSelectionEditState();
+        if (wasEditing)
         {
             ResumeDisplayCacheAfterInteraction(moved);
         }
@@ -1209,8 +1631,7 @@ internal sealed partial class AnnotatorForm : Form
         }
 
         selectedItemIndex = index;
-        movingSelection = false;
-        selectionMoved = false;
+        ResetSelectionEditState();
     }
 
     private void AddAnnotation(AnnotationItem item)
@@ -1270,6 +1691,15 @@ internal sealed partial class AnnotatorForm : Form
                 int index = Math.Max(0, Math.Min(action.Index, items.Count));
                 items.Insert(index, action.Item);
                 SelectAnnotation(index);
+            }
+            else if (action.Kind == AnnotationUndoKind.Transform && action.Item != null && action.Before != null)
+            {
+                int index = items.IndexOf(action.Item);
+                if (index >= 0)
+                {
+                    ApplyAnnotationSnapshot(action.Item, action.Before);
+                    SelectAnnotation(index);
+                }
             }
 
             MarkAnnotationsChanged();
@@ -1494,9 +1924,14 @@ internal sealed partial class AnnotatorForm : Form
 
         if (e.Button == MouseButtons.Right)
         {
+            bool wasEditingSelection = movingSelection || resizingSelection;
+            ResetSelectionEditState();
+            if (wasEditingSelection)
+            {
+                ResumeDisplayCacheAfterInteraction(false);
+            }
             panning = true;
             drawing = false;
-            movingSelection = false;
             currentPenItem = null;
             lastPanPoint = e.Location;
             canvas.Cursor = Cursors.Hand;
@@ -1523,6 +1958,28 @@ internal sealed partial class AnnotatorForm : Form
             HideInlineTextInput(true);
         }
 
+        SelectionHandle hitHandle = HitTestSelectionHandle(startPoint);
+        if (hitHandle != SelectionHandle.None && HasSelectedItem())
+        {
+            CommitInlineTextInput();
+            resizingSelection = true;
+            activeSelectionHandle = hitHandle;
+            selectionMoved = false;
+            moveStartPoint = startPoint;
+            moveCurrentPoint = startPoint;
+            lastMovePoint = startPoint;
+            selectionEditStartState = CaptureAnnotation(items[selectedItemIndex]);
+            selectionEditStartBounds = GetItemBounds(items[selectedItemIndex]);
+            drawing = false;
+            currentPenItem = null;
+            SuspendDisplayCacheForInteraction();
+            EnsureMoveBackgroundCache(GetView());
+            canvas.Cursor = GetSelectionHandleCursor(hitHandle);
+            canvas.Capture = true;
+            RequestCanvasRender();
+            return;
+        }
+
         int hitIndex = HitTestAnnotation(startPoint);
         if (hitIndex >= 0)
         {
@@ -1533,6 +1990,8 @@ internal sealed partial class AnnotatorForm : Form
             moveStartPoint = startPoint;
             moveCurrentPoint = startPoint;
             lastMovePoint = startPoint;
+            selectionEditStartState = CaptureAnnotation(items[selectedItemIndex]);
+            selectionEditStartBounds = GetItemBounds(items[selectedItemIndex]);
             drawing = false;
             currentPenItem = null;
             SuspendDisplayCacheForInteraction();
@@ -1954,7 +2413,7 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
-        if (movingSelection)
+        if (movingSelection || resizingSelection)
         {
             if (!HasSelectedItem())
             {
@@ -1971,6 +2430,7 @@ internal sealed partial class AnnotatorForm : Form
                 selectionMoved = Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
                 RequestCanvasRender();
             }
+            canvas.Cursor = resizingSelection ? GetSelectionHandleCursor(activeSelectionHandle) : Cursors.SizeAll;
             return;
         }
 
@@ -1980,6 +2440,13 @@ internal sealed partial class AnnotatorForm : Form
             if (inlineTextEditing && IsPointInInlineTextInput(point))
             {
                 canvas.Cursor = Cursors.IBeam;
+                return;
+            }
+
+            SelectionHandle hoverHandle = HitTestSelectionHandle(point);
+            if (hoverHandle != SelectionHandle.None)
+            {
+                canvas.Cursor = GetSelectionHandleCursor(hoverHandle);
                 return;
             }
 
@@ -2027,20 +2494,40 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
-        if (movingSelection)
+        if (movingSelection || resizingSelection)
         {
+            bool wasMovingSelection = movingSelection;
+            SelectionHandle resizeHandle = activeSelectionHandle;
+            AnnotationSnapshot before = selectionEditStartState;
+            RectangleF originalBounds = selectionEditStartBounds;
             moveCurrentPoint = ToImagePoint(e.Location);
             PointF offset = GetMoveOffset();
-            bool moved = selectionMoved || Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
-            if (moved && HasSelectedItem())
+            bool changed = selectionMoved || Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
+            if (changed && HasSelectedItem())
             {
-                MoveAnnotation(items[selectedItemIndex], offset.X, offset.Y);
+                AnnotationItem item = items[selectedItemIndex];
+                if (before == null)
+                {
+                    before = CaptureAnnotation(item);
+                }
+
+                ApplyAnnotationSnapshot(item, before);
+                if (wasMovingSelection)
+                {
+                    MoveAnnotation(item, offset.X, offset.Y);
+                }
+                else
+                {
+                    ApplyResizeToAnnotation(item, before, originalBounds, resizeHandle, offset);
+                }
+
+                AnnotationSnapshot after = CaptureAnnotation(item);
+                changed = RecordTransformUndo(item, selectedItemIndex, before, after);
             }
-            movingSelection = false;
+            ResetSelectionEditState();
             canvas.Cursor = Cursors.Cross;
             canvas.Capture = false;
-            ResumeDisplayCacheAfterInteraction(moved);
-            selectionMoved = false;
+            ResumeDisplayCacheAfterInteraction(changed);
             RequestCanvasRender();
             return;
         }
@@ -2263,6 +2750,8 @@ internal static class Program
     private static void RunSelfTest()
     {
         AssertGraphicsTransformOrder();
+        AssertAnnotationPointReplacementInvalidatesCache();
+        AssertResizeTransform();
 
         AssertMeaningful(new AnnotationItem
         {
@@ -2311,6 +2800,65 @@ internal static class Program
             AssertNear(point[0].X, 126f, "GDI+ transform x");
             AssertNear(point[0].Y, 98f, "GDI+ transform y");
         }
+    }
+
+    private static void AssertAnnotationPointReplacementInvalidatesCache()
+    {
+        var item = new AnnotationItem();
+        item.Tool = ToolMode.Pen;
+        item.AddPoint(new PointF(1, 1));
+        item.GetDrawingPoints();
+        item.SetPoints(new PointF[] { new PointF(4, 5), new PointF(8, 9) });
+
+        PointF[] points = item.GetDrawingPoints();
+        if (points.Length != 2)
+        {
+            throw new InvalidOperationException("Point replacement self test failed.");
+        }
+        AssertNear(points[0].X, 4f, "point replacement x");
+        AssertNear(points[1].Y, 9f, "point replacement y");
+    }
+
+    private static void AssertResizeTransform()
+    {
+        var item = new AnnotationItem
+        {
+            Tool = ToolMode.Rect,
+            Start = new PointF(10, 10),
+            End = new PointF(30, 30),
+            StrokeColor = AppStyles.DefaultStroke,
+            StrokeWidth = 4f
+        };
+
+        Type formType = typeof(AnnotatorForm);
+        System.Reflection.MethodInfo capture = formType.GetMethod(
+            "CaptureAnnotation",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        System.Reflection.MethodInfo apply = formType.GetMethod(
+            "ApplyResizeToAnnotation",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Type handleType = formType.GetNestedType(
+            "SelectionHandle",
+            System.Reflection.BindingFlags.NonPublic);
+        if (capture == null || apply == null || handleType == null)
+        {
+            throw new InvalidOperationException("Resize transform self test cannot find helpers.");
+        }
+
+        object snapshot = capture.Invoke(null, new object[] { item });
+        object rightHandle = Enum.Parse(handleType, "Right");
+        apply.Invoke(null, new object[]
+        {
+            item,
+            snapshot,
+            new RectangleF(10, 10, 20, 20),
+            rightHandle,
+            new PointF(5, 0)
+        });
+
+        AssertNear(item.Start.X, 10f, "resize transform left");
+        AssertNear(item.End.X, 35f, "resize transform right");
+        AssertNear(item.End.Y, 30f, "resize transform bottom");
     }
 
     private static void AssertNear(float actual, float expected, string label)
