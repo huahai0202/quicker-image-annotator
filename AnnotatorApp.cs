@@ -4,8 +4,6 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows.Forms;
 
 internal sealed partial class AnnotatorForm : Form
@@ -58,16 +56,8 @@ internal sealed partial class AnnotatorForm : Form
     private const float SelectionHitTolerancePixels = 8f;
     private const float MoveSampleThresholdPixels = 0.5f;
     private const float PenSampleThresholdPixels = 0.9f;
-    private bool inlineTextEditing;
-    private InlineImeTextBox inlineTextBox;
-    private string inlineText = string.Empty;
-    private string inlineCompositionText = string.Empty;
-    private bool inlineTextSelecting;
-    private int inlineTextSelectionAnchor;
-    private bool inlineCaretVisible;
-    private readonly Timer inlineCaretTimer = new Timer();
-    private PointF textInputPosition;
     private const int MosaicBlockSize = 18;
+    private static readonly PointF[] EmptyPoints = new PointF[0];
 
     private enum AnnotationUndoKind
     {
@@ -96,7 +86,7 @@ internal sealed partial class AnnotatorForm : Form
         public PointF End;
         public Color StrokeColor;
         public float StrokeWidth;
-        public PointF[] Points = new PointF[0];
+        public PointF[] Points = EmptyPoints;
         public string Text;
     }
 
@@ -119,96 +109,6 @@ internal sealed partial class AnnotatorForm : Form
             Index = index;
             Before = before;
         }
-    }
-
-    private sealed class InlineImeTextBox : TextBox
-    {
-        private const int WmImeComposition = 0x010F;
-        private const int WmImeEndComposition = 0x010E;
-        private const int GcsCompReadStr = 0x0001;
-        private const int GcsCompStr = 0x0008;
-
-        public event EventHandler CompositionChanged;
-        public string CompositionText = string.Empty;
-
-        protected override void WndProc(ref Message m)
-        {
-            base.WndProc(ref m);
-            if (m.Msg == WmImeComposition)
-            {
-                SetCompositionText(GetCurrentCompositionText(Handle));
-            }
-            else if (m.Msg == WmImeEndComposition)
-            {
-                SetCompositionText(string.Empty);
-            }
-        }
-
-        private void SetCompositionText(string value)
-        {
-            value = value ?? string.Empty;
-            if (string.Equals(CompositionText, value, StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            CompositionText = value;
-            EventHandler handler = CompositionChanged;
-            if (handler != null)
-            {
-                handler(this, EventArgs.Empty);
-            }
-        }
-
-        private static string GetCurrentCompositionText(IntPtr handle)
-        {
-            string readingText = GetCompositionString(handle, GcsCompReadStr);
-            if (!string.IsNullOrEmpty(readingText))
-            {
-                return readingText;
-            }
-            return GetCompositionString(handle, GcsCompStr);
-        }
-
-        private static string GetCompositionString(IntPtr handle, int kind)
-        {
-            IntPtr context = ImmGetContext(handle);
-            if (context == IntPtr.Zero)
-            {
-                return string.Empty;
-            }
-
-            try
-            {
-                int byteCount = ImmGetCompositionString(context, kind, null, 0);
-                if (byteCount <= 0)
-                {
-                    return string.Empty;
-                }
-
-                byte[] buffer = new byte[byteCount];
-                int copied = ImmGetCompositionString(context, kind, buffer, buffer.Length);
-                if (copied <= 0)
-                {
-                    return string.Empty;
-                }
-
-                return Encoding.Unicode.GetString(buffer, 0, copied).TrimEnd('\0');
-            }
-            finally
-            {
-                ImmReleaseContext(handle, context);
-            }
-        }
-
-        [DllImport("imm32.dll")]
-        private static extern IntPtr ImmGetContext(IntPtr hWnd);
-
-        [DllImport("imm32.dll")]
-        private static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
-
-        [DllImport("imm32.dll", CharSet = CharSet.Unicode)]
-        private static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, byte[] lpBuf, int dwBufLen);
     }
 
     public AnnotatorForm(string path, Bitmap image)
@@ -311,6 +211,7 @@ internal sealed partial class AnnotatorForm : Form
             cacheRefreshTimer.Dispose();
             inlineCaretTimer.Stop();
             inlineCaretTimer.Dispose();
+            DisposeInlineTextResources();
             canvasRenderScheduler.Dispose();
             imePositionThrottle.Dispose();
             toolbarToolTip.Dispose();
@@ -550,22 +451,6 @@ internal sealed partial class AnnotatorForm : Form
         return new PointF(x, y);
     }
 
-    private void Canvas_MouseWheel(object sender, MouseEventArgs e)
-    {
-        PointF anchorImage = ToImagePoint(e.Location);
-        float wheelSteps = e.Delta / 120f;
-        float step = (float)Math.Pow(1.12, wheelSteps);
-        SetZoomKeepingAnchor(ClampZoom(zoomFactor * step), e.Location, anchorImage);
-        if (!suspendDisplayCache)
-        {
-            ResetDisplayCache();
-        }
-        suspendDisplayCache = true;
-        cacheRefreshTimer.Stop();
-        cacheRefreshTimer.Start();
-        RequestCanvasRender();
-    }
-
     private void SetZoomKeepingAnchor(float newZoom, Point screenPoint, PointF imagePoint)
     {
         zoomFactor = ClampZoom(newZoom);
@@ -694,6 +579,18 @@ internal sealed partial class AnnotatorForm : Form
             return;
         }
 
+        if (item.Tool == ToolMode.Text)
+        {
+            DrawTextAnnotation(g, item, itemColor, itemWidth);
+            return;
+        }
+
+        if (item.Tool == ToolMode.Mosaic)
+        {
+            DrawMosaic(g, item);
+            return;
+        }
+
         using (var pen = new Pen(itemColor, Math.Max(0.1f, itemWidth)))
         {
             pen.StartCap = LineCap.Round;
@@ -720,19 +617,21 @@ internal sealed partial class AnnotatorForm : Form
             {
                 g.DrawLines(pen, item.GetDrawingPoints());
             }
-            else if (item.Tool == ToolMode.Text && !string.IsNullOrEmpty(item.Text))
-            {
-                float fontSize = item.StrokeWidth * 6f;
-                using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-                using (Brush textBrush = new SolidBrush(item.StrokeColor))
-                {
-                    g.DrawString(item.Text, font, textBrush, item.Start);
-                }
-            }
-            else if (item.Tool == ToolMode.Mosaic)
-            {
-                DrawMosaic(g, item);
-            }
+        }
+    }
+
+    private static void DrawTextAnnotation(Graphics g, AnnotationItem item, Color color, float width)
+    {
+        if (string.IsNullOrEmpty(item.Text))
+        {
+            return;
+        }
+
+        float fontSize = Math.Max(1f, width * 6f);
+        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
+        using (Brush textBrush = new SolidBrush(color))
+        {
+            g.DrawString(item.Text, font, textBrush, item.Start);
         }
     }
 
@@ -757,7 +656,7 @@ internal sealed partial class AnnotatorForm : Form
         float length = (float)Math.Sqrt(dx * dx + dy * dy);
         if (length < MinAnnotationExtent)
         {
-            return new PointF[0];
+            return EmptyPoints;
         }
 
         float ux = dx / length;
@@ -1006,24 +905,6 @@ internal sealed partial class AnnotatorForm : Form
         return bounds;
     }
 
-    private RectangleF GetTextBounds(AnnotationItem item)
-    {
-        string text = item.Text ?? string.Empty;
-        float fontSize = Math.Max(1f, item.StrokeWidth * 6f);
-        if (text.Length == 0)
-        {
-            return new RectangleF(item.Start.X, item.Start.Y, fontSize, fontSize);
-        }
-
-        using (Graphics g = canvas.CreateGraphics())
-        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-        using (StringFormat format = CreateInlineTextFormat())
-        {
-            SizeF size = g.MeasureString(text, font, int.MaxValue, format);
-            return new RectangleF(item.Start, size);
-        }
-    }
-
     private static RectangleF GetPointsBounds(List<PointF> points)
     {
         if (points == null || points.Count == 0)
@@ -1054,183 +935,6 @@ internal sealed partial class AnnotatorForm : Form
             Math.Max(a.Y, b.Y));
     }
 
-    private void DrawInlineTextInput(Graphics g, float scale)
-    {
-        float fontSize = strokeWidth * 6f;
-        string text = inlineText ?? string.Empty;
-        string composition = inlineCompositionText ?? string.Empty;
-        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-        using (Brush textBrush = new SolidBrush(strokeColor))
-        using (StringFormat format = CreateInlineTextFormat())
-        {
-            int selectionStart = GetInlineSelectionStart();
-            int selectionLength = GetInlineSelectionLength();
-            selectionStart = Math.Max(0, Math.Min(text.Length, selectionStart));
-            selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, selectionLength));
-            int caretIndex = GetInlineCaretIndex();
-            float textHeight = MeasureInlineTextHeight(g, font, format);
-
-            if (composition.Length > 0)
-            {
-                int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
-                insertionIndex = Math.Max(0, Math.Min(text.Length, insertionIndex));
-                int replaceEnd = selectionLength > 0 ? selectionStart + selectionLength : insertionIndex;
-                string beforeText = text.Substring(0, insertionIndex);
-                string afterText = text.Substring(replaceEnd);
-                float beforeWidth = MeasureInlineTextWidth(g, font, format, beforeText, beforeText.Length);
-                float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
-                float compositionX = textInputPosition.X + beforeWidth;
-
-                if (beforeText.Length > 0)
-                {
-                    g.DrawString(beforeText, font, textBrush, textInputPosition);
-                }
-                g.DrawString(composition, font, textBrush, new PointF(compositionX, textInputPosition.Y));
-                if (afterText.Length > 0)
-                {
-                    g.DrawString(afterText, font, textBrush, new PointF(compositionX + compositionWidth, textInputPosition.Y));
-                }
-                using (Pen compositionPen = new Pen(strokeColor, Math.Max(0.8f, 1f / Math.Max(0.001f, scale))))
-                {
-                    float underlineY = textInputPosition.Y + textHeight - Math.Max(1.2f, 2f / Math.Max(0.001f, scale));
-                    g.DrawLine(compositionPen, compositionX, underlineY, compositionX + Math.Max(1f, compositionWidth), underlineY);
-                }
-
-                if (inlineCaretVisible)
-                {
-                    DrawInlineCaret(g, compositionX + compositionWidth, textHeight, scale);
-                }
-                return;
-            }
-
-            DrawCommittedInlineText(g, font, format, textBrush, text, selectionStart, selectionLength, textHeight);
-
-            if (inlineCaretVisible && selectionLength == 0)
-            {
-                float caretX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, caretIndex);
-                DrawInlineCaret(g, caretX, textHeight, scale);
-            }
-        }
-    }
-
-    private void DrawCommittedInlineText(Graphics g, Font font, StringFormat format, Brush textBrush, string text, int selectionStart, int selectionLength, float textHeight)
-    {
-        if (selectionLength > 0)
-        {
-            float selectionX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, selectionStart);
-            string selectedText = text.Substring(selectionStart, selectionLength);
-            float selectionWidth = MeasureInlineTextWidth(g, font, format, selectedText, selectedText.Length);
-            using (Brush selectionBrush = new SolidBrush(Color.FromArgb(190, AppStyles.OptionSelectedForeground)))
-            {
-                g.FillRectangle(selectionBrush, selectionX, textInputPosition.Y, Math.Max(1f, selectionWidth), textHeight);
-            }
-        }
-
-        if (text.Length > 0)
-        {
-            g.DrawString(text, font, textBrush, textInputPosition);
-            if (selectionLength > 0)
-            {
-                string selectedText = text.Substring(selectionStart, selectionLength);
-                float selectionX = textInputPosition.X + MeasureInlineTextWidth(g, font, format, text, selectionStart);
-                using (Brush selectedTextBrush = new SolidBrush(Color.White))
-                {
-                    g.DrawString(selectedText, font, selectedTextBrush, new PointF(selectionX, textInputPosition.Y));
-                }
-            }
-        }
-    }
-
-    private void DrawInlineCaret(Graphics g, float caretX, float textHeight, float scale)
-    {
-        float caretWidth = Math.Max(1f, 1f / Math.Max(0.001f, scale));
-        using (Pen caretPen = new Pen(strokeColor, caretWidth))
-        {
-            g.DrawLine(caretPen, caretX, textInputPosition.Y, caretX, textInputPosition.Y + textHeight);
-        }
-    }
-
-    private static float MeasureInlineTextWidth(Graphics g, Font font, StringFormat format, string text, int count)
-    {
-        if (string.IsNullOrEmpty(text) || count <= 0)
-        {
-            return 0f;
-        }
-
-        count = Math.Min(count, text.Length);
-        string measuredText = text.Substring(0, count);
-        using (StringFormat measureFormat = (StringFormat)format.Clone())
-        {
-            measureFormat.SetMeasurableCharacterRanges(new CharacterRange[] { new CharacterRange(0, measuredText.Length) });
-            RectangleF layout = new RectangleF(0, 0, 100000, 10000);
-            Region[] regions = g.MeasureCharacterRanges(measuredText, font, layout, measureFormat);
-            try
-            {
-                if (regions.Length > 0)
-                {
-                    RectangleF bounds = regions[0].GetBounds(g);
-                    if (bounds.Right > 0)
-                    {
-                        return bounds.Right;
-                    }
-                }
-            }
-            finally
-            {
-                for (int i = 0; i < regions.Length; i++)
-                {
-                    regions[i].Dispose();
-                }
-            }
-        }
-
-        return g.MeasureString(measuredText, font, int.MaxValue, format).Width;
-    }
-
-    private static float MeasureInlineTextHeight(Graphics g, Font font, StringFormat format)
-    {
-        return g.MeasureString("M", font, int.MaxValue, format).Height;
-    }
-
-    private float MeasureInlineEditingWidth(Graphics g, Font font, StringFormat format, string text, string composition)
-    {
-        text = text ?? string.Empty;
-        composition = composition ?? string.Empty;
-        if (composition.Length == 0)
-        {
-            return Math.Max(font.Size, MeasureInlineTextWidth(g, font, format, text, text.Length));
-        }
-
-        int selectionStart = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
-        int selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, GetInlineSelectionLength()));
-        int caretIndex = Math.Max(0, Math.Min(text.Length, GetInlineCaretIndex()));
-        int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
-        int replaceEnd = selectionLength > 0 ? selectionStart + selectionLength : insertionIndex;
-        float beforeWidth = MeasureInlineTextWidth(g, font, format, text, insertionIndex);
-        float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
-        string afterText = text.Substring(replaceEnd);
-        float afterWidth = MeasureInlineTextWidth(g, font, format, afterText, afterText.Length);
-        return Math.Max(font.Size, beforeWidth + compositionWidth + afterWidth);
-    }
-
-    private static StringFormat CreateInlineTextFormat()
-    {
-        StringFormat format = new StringFormat(StringFormat.GenericTypographic);
-        format.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces;
-        return format;
-    }
-
-    private void DrawMosaic(Graphics g, AnnotationItem item)
-    {
-        Rectangle rect = GetMosaicRect(item, baseImage.Width, baseImage.Height);
-        if (rect.Width < 2 || rect.Height < 2)
-        {
-            return;
-        }
-
-        DrawMosaicBlocks(g, baseImage, rect);
-    }
-
     private static RectangleF NormalizeRect(PointF a, PointF b)
     {
         float x = Math.Min(a.X, b.X);
@@ -1238,75 +942,6 @@ internal sealed partial class AnnotatorForm : Form
         float w = Math.Abs(a.X - b.X);
         float h = Math.Abs(a.Y - b.Y);
         return new RectangleF(x, y, w, h);
-    }
-
-    private static void ApplyMosaic(Bitmap bitmap, AnnotationItem item)
-    {
-        Rectangle rect = GetMosaicRect(item, bitmap.Width, bitmap.Height);
-        if (rect.Width < 2 || rect.Height < 2)
-        {
-            return;
-        }
-
-        using (Graphics g = Graphics.FromImage(bitmap))
-        {
-            DrawMosaicBlocks(g, bitmap, rect);
-        }
-    }
-
-    private static Rectangle GetMosaicRect(AnnotationItem item, int width, int height)
-    {
-        RectangleF rf = NormalizeRect(item.Start, item.End);
-        return Rectangle.Intersect(
-            Rectangle.Round(rf),
-            new Rectangle(0, 0, width, height));
-    }
-
-    private static void DrawMosaicBlocks(Graphics g, Bitmap sampleBitmap, Rectangle rect)
-    {
-        using (var brush = new SolidBrush(Color.Black))
-        using (var overlay = new SolidBrush(Color.FromArgb(110, 0, 0, 0)))
-        {
-            for (int y = rect.Top; y < rect.Bottom; y += MosaicBlockSize)
-            {
-                for (int x = rect.Left; x < rect.Right; x += MosaicBlockSize)
-                {
-                    int w = Math.Min(MosaicBlockSize, rect.Right - x);
-                    int h = Math.Min(MosaicBlockSize, rect.Bottom - y);
-                    Color color = AverageColor(sampleBitmap, x, y, w, h);
-                    brush.Color = Color.FromArgb(color.R / 2, color.G / 2, color.B / 2);
-                    g.FillRectangle(brush, x, y, w, h);
-                }
-            }
-            g.FillRectangle(overlay, rect);
-        }
-    }
-
-    private static Color AverageColor(Bitmap bitmap, int x, int y, int w, int h)
-    {
-        long r = 0;
-        long g = 0;
-        long b = 0;
-        long count = 0;
-        int step = Math.Max(1, Math.Min(w, h) / 4);
-
-        for (int yy = y; yy < y + h; yy += step)
-        {
-            for (int xx = x; xx < x + w; xx += step)
-            {
-                Color c = bitmap.GetPixel(xx, yy);
-                r += c.R;
-                g += c.G;
-                b += c.B;
-                count++;
-            }
-        }
-
-        if (count == 0)
-        {
-            return Color.Gray;
-        }
-        return Color.FromArgb((int)(r / count), (int)(g / count), (int)(b / count));
     }
 
     private static bool IsMeaningfulAnnotation(AnnotationItem item)
@@ -1457,8 +1092,8 @@ internal sealed partial class AnnotatorForm : Form
             return false;
         }
 
-        PointF[] aPoints = a.Points ?? new PointF[0];
-        PointF[] bPoints = b.Points ?? new PointF[0];
+        PointF[] aPoints = a.Points ?? EmptyPoints;
+        PointF[] bPoints = b.Points ?? EmptyPoints;
         if (aPoints.Length != bPoints.Length)
         {
             return false;
@@ -1918,706 +1553,6 @@ internal sealed partial class AnnotatorForm : Form
         return true;
     }
 
-    private void Canvas_MouseDown(object sender, MouseEventArgs e)
-    {
-        toolOptionsPanel.Visible = false;
-
-        if (e.Button == MouseButtons.Right)
-        {
-            bool wasEditingSelection = movingSelection || resizingSelection;
-            ResetSelectionEditState();
-            if (wasEditingSelection)
-            {
-                ResumeDisplayCacheAfterInteraction(false);
-            }
-            panning = true;
-            drawing = false;
-            currentPenItem = null;
-            lastPanPoint = e.Location;
-            canvas.Cursor = Cursors.Hand;
-            canvas.Capture = true;
-            return;
-        }
-
-        if (e.Button != MouseButtons.Left)
-        {
-            return;
-        }
-
-        startPoint = ToImagePoint(e.Location);
-        currentPoint = startPoint;
-
-        if (inlineTextEditing)
-        {
-            if (IsPointInInlineTextInput(startPoint))
-            {
-                BeginInlineTextSelection(startPoint);
-                return;
-            }
-
-            HideInlineTextInput(true);
-        }
-
-        SelectionHandle hitHandle = HitTestSelectionHandle(startPoint);
-        if (hitHandle != SelectionHandle.None && HasSelectedItem())
-        {
-            CommitInlineTextInput();
-            resizingSelection = true;
-            activeSelectionHandle = hitHandle;
-            selectionMoved = false;
-            moveStartPoint = startPoint;
-            moveCurrentPoint = startPoint;
-            lastMovePoint = startPoint;
-            selectionEditStartState = CaptureAnnotation(items[selectedItemIndex]);
-            selectionEditStartBounds = GetItemBounds(items[selectedItemIndex]);
-            drawing = false;
-            currentPenItem = null;
-            SuspendDisplayCacheForInteraction();
-            EnsureMoveBackgroundCache(GetView());
-            canvas.Cursor = GetSelectionHandleCursor(hitHandle);
-            canvas.Capture = true;
-            RequestCanvasRender();
-            return;
-        }
-
-        int hitIndex = HitTestAnnotation(startPoint);
-        if (hitIndex >= 0)
-        {
-            CommitInlineTextInput();
-            SelectAnnotation(hitIndex);
-            movingSelection = true;
-            selectionMoved = false;
-            moveStartPoint = startPoint;
-            moveCurrentPoint = startPoint;
-            lastMovePoint = startPoint;
-            selectionEditStartState = CaptureAnnotation(items[selectedItemIndex]);
-            selectionEditStartBounds = GetItemBounds(items[selectedItemIndex]);
-            drawing = false;
-            currentPenItem = null;
-            SuspendDisplayCacheForInteraction();
-            EnsureMoveBackgroundCache(GetView());
-            canvas.Cursor = Cursors.SizeAll;
-            canvas.Capture = true;
-            RequestCanvasRender();
-            return;
-        }
-
-        ClearSelection();
-
-        if (currentTool == ToolMode.Text)
-        {
-            ShowInlineTextInput(e.Location);
-            return;
-        }
-
-        drawing = true;
-        currentPenItem = null;
-        canvas.Capture = true;
-
-        if (currentTool == ToolMode.Pen)
-        {
-            currentPenItem = new AnnotationItem();
-            currentPenItem.Tool = ToolMode.Pen;
-            currentPenItem.StrokeColor = strokeColor;
-            currentPenItem.StrokeWidth = strokeWidth;
-            AppendPenPointIfNeeded(currentPenItem, startPoint, 0f);
-        }
-    }
-
-    private void ShowInlineTextInput(Point screenLocation)
-    {
-        if (inlineTextEditing)
-        {
-            HideInlineTextInput(true);
-        }
-
-        textInputPosition = ToImagePoint(screenLocation);
-        inlineText = string.Empty;
-        inlineCompositionText = string.Empty;
-        inlineTextEditing = true;
-        inlineTextSelecting = false;
-        inlineTextSelectionAnchor = 0;
-        inlineTextBox = CreateImeHostTextBox(screenLocation);
-        inlineTextBox.KeyDown += InlineTextBox_KeyDown;
-        inlineTextBox.KeyUp += InlineTextBox_KeyUp;
-        inlineTextBox.TextChanged += InlineTextBox_TextChanged;
-        inlineTextBox.CompositionChanged += InlineTextBox_CompositionChanged;
-        canvas.Controls.Add(inlineTextBox);
-        inlineTextBox.BringToFront();
-        RestartInlineCaret();
-        inlineTextBox.Focus();
-        RequestCanvasRender();
-    }
-
-    private void HideInlineTextInput(bool saveText)
-    {
-        if (!inlineTextEditing)
-        {
-            return;
-        }
-
-        string text = inlineTextBox == null ? (inlineText ?? string.Empty).Trim() : inlineTextBox.Text.Trim();
-        inlineTextEditing = false;
-        inlineTextSelecting = false;
-        inlineText = string.Empty;
-        inlineCompositionText = string.Empty;
-        inlineCaretVisible = false;
-        inlineCaretTimer.Stop();
-        if (inlineTextBox != null)
-        {
-            try
-            {
-                inlineTextBox.KeyDown -= InlineTextBox_KeyDown;
-                inlineTextBox.KeyUp -= InlineTextBox_KeyUp;
-                inlineTextBox.TextChanged -= InlineTextBox_TextChanged;
-                inlineTextBox.CompositionChanged -= InlineTextBox_CompositionChanged;
-                canvas.Controls.Remove(inlineTextBox);
-                inlineTextBox.Dispose();
-            }
-            catch
-            {
-            }
-            finally
-            {
-                inlineTextBox = null;
-            }
-        }
-
-        if (saveText && !string.IsNullOrWhiteSpace(text))
-        {
-            var item = new AnnotationItem();
-            item.Tool = ToolMode.Text;
-            item.Start = textInputPosition;
-            item.End = textInputPosition;
-            item.StrokeColor = strokeColor;
-            item.StrokeWidth = strokeWidth;
-            item.Text = text;
-            AddAnnotation(item);
-        }
-        if (!IsDisposed && canvas.IsHandleCreated)
-        {
-            canvas.Focus();
-        }
-        RequestCanvasRender();
-    }
-
-    private void CommitInlineTextInput()
-    {
-        if (inlineTextEditing)
-        {
-            HideInlineTextInput(true);
-        }
-    }
-
-    private bool CancelInlineTextInput()
-    {
-        if (!inlineTextEditing)
-        {
-            return false;
-        }
-
-        HideInlineTextInput(false);
-        return true;
-    }
-
-    private bool IsPointInInlineTextInput(PointF point)
-    {
-        RectangleF bounds = GetInlineTextInputBounds();
-        if (bounds.IsEmpty)
-        {
-            return false;
-        }
-
-        float tolerance = GetSelectionHitTolerance();
-        bounds.Inflate(tolerance, tolerance);
-        return bounds.Contains(point);
-    }
-
-    private RectangleF GetInlineTextInputBounds()
-    {
-        string text = inlineTextBox == null ? (inlineText ?? string.Empty) : inlineTextBox.Text;
-        string composition = inlineCompositionText ?? string.Empty;
-        float fontSize = Math.Max(1f, strokeWidth * 6f);
-        using (Graphics g = canvas.CreateGraphics())
-        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-        using (StringFormat format = CreateInlineTextFormat())
-        {
-            float width = MeasureInlineEditingWidth(g, font, format, text, composition);
-            float height = MeasureInlineTextHeight(g, font, format);
-            return new RectangleF(textInputPosition.X, textInputPosition.Y, width, height);
-        }
-    }
-
-    private int GetInlineTextIndexAtPoint(PointF point)
-    {
-        string text = inlineTextBox == null ? (inlineText ?? string.Empty) : inlineTextBox.Text;
-        string composition = inlineCompositionText ?? string.Empty;
-        if (text.Length == 0)
-        {
-            return 0;
-        }
-
-        float localX = point.X - textInputPosition.X;
-        if (localX <= 0)
-        {
-            return 0;
-        }
-
-        float fontSize = Math.Max(1f, strokeWidth * 6f);
-        using (Graphics g = canvas.CreateGraphics())
-        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-        using (StringFormat format = CreateInlineTextFormat())
-        {
-            if (composition.Length > 0)
-            {
-                int insertionIndex = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
-                float beforeWidth = MeasureInlineTextWidth(g, font, format, text, insertionIndex);
-                float compositionWidth = MeasureInlineTextWidth(g, font, format, composition, composition.Length);
-                if (localX >= beforeWidth && localX <= beforeWidth + compositionWidth)
-                {
-                    return insertionIndex;
-                }
-
-                if (localX > beforeWidth + compositionWidth)
-                {
-                    localX -= compositionWidth;
-                }
-            }
-
-            float previousWidth = 0f;
-            for (int i = 1; i <= text.Length; i++)
-            {
-                float width = MeasureInlineTextWidth(g, font, format, text, i);
-                if (localX <= (previousWidth + width) / 2f)
-                {
-                    return i - 1;
-                }
-                previousWidth = width;
-            }
-        }
-        return text.Length;
-    }
-
-    private void BeginInlineTextSelection(PointF point)
-    {
-        if (inlineTextBox == null)
-        {
-            return;
-        }
-
-        int index = GetInlineTextIndexAtPoint(point);
-        inlineTextSelectionAnchor = index;
-        inlineTextSelecting = true;
-        inlineTextBox.Select(index, 0);
-        inlineTextBox.Focus();
-        canvas.Cursor = Cursors.IBeam;
-        canvas.Capture = true;
-        SyncInlineTextInputState();
-    }
-
-    private void UpdateInlineTextSelection(PointF point)
-    {
-        if (inlineTextBox == null)
-        {
-            return;
-        }
-
-        int index = GetInlineTextIndexAtPoint(point);
-        int start = Math.Min(inlineTextSelectionAnchor, index);
-        int length = Math.Abs(index - inlineTextSelectionAnchor);
-        inlineTextBox.Select(start, length);
-        SyncInlineTextInputState();
-    }
-
-    private InlineImeTextBox CreateImeHostTextBox(Point screenLocation)
-    {
-        float fontSize = Math.Max(1f, strokeWidth * 6f);
-        var textBox = new InlineImeTextBox();
-        textBox.Multiline = false;
-        textBox.BorderStyle = BorderStyle.None;
-        textBox.AutoSize = false;
-        textBox.ShortcutsEnabled = true;
-        textBox.TabStop = false;
-        textBox.Font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold);
-        textBox.BackColor = strokeColor;
-        textBox.ForeColor = strokeColor;
-        textBox.Left = Math.Max(0, Math.Min(canvas.ClientSize.Width - 1, screenLocation.X));
-        textBox.Top = Math.Max(0, Math.Min(canvas.ClientSize.Height - 1, screenLocation.Y));
-        textBox.Width = 1;
-        textBox.Height = 1;
-        return textBox;
-    }
-
-    private int GetInlineSelectionStart()
-    {
-        return inlineTextBox == null ? 0 : inlineTextBox.SelectionStart;
-    }
-
-    private int GetInlineSelectionLength()
-    {
-        return inlineTextBox == null ? 0 : inlineTextBox.SelectionLength;
-    }
-
-    private int GetInlineCaretIndex()
-    {
-        if (inlineTextBox == null)
-        {
-            return (inlineText ?? string.Empty).Length;
-        }
-
-        return Math.Max(0, Math.Min(inlineTextBox.TextLength, inlineTextBox.SelectionStart + inlineTextBox.SelectionLength));
-    }
-
-    private void InlineTextBox_KeyDown(object sender, KeyEventArgs e)
-    {
-        if (!HandleInlineTextKeyDown(e) && !IsDisposed && IsHandleCreated)
-        {
-            BeginInvoke((MethodInvoker)SyncInlineTextInputState);
-        }
-    }
-
-    private void InlineTextBox_KeyUp(object sender, KeyEventArgs e)
-    {
-        SyncInlineTextInputState();
-    }
-
-    private void InlineTextBox_TextChanged(object sender, EventArgs e)
-    {
-        SyncInlineTextInputState();
-    }
-
-    private void InlineTextBox_CompositionChanged(object sender, EventArgs e)
-    {
-        SyncInlineTextInputState();
-    }
-
-    private void SyncInlineTextInputState()
-    {
-        if (inlineTextBox == null)
-        {
-            return;
-        }
-
-        inlineText = inlineTextBox.Text;
-        inlineCompositionText = inlineTextBox.CompositionText;
-        PositionImeHostAtCaret();
-        RestartInlineCaret();
-        RequestCanvasRender();
-    }
-
-    private void PositionImeHostAtCaret()
-    {
-        if (inlineTextBox == null)
-        {
-            return;
-        }
-
-        Point caret = GetInlineCaretCanvasPoint();
-        inlineTextBox.Left = Math.Max(0, Math.Min(canvas.ClientSize.Width - 1, caret.X));
-        inlineTextBox.Top = Math.Max(0, Math.Min(canvas.ClientSize.Height - 1, caret.Y));
-    }
-
-    private Point GetInlineCaretCanvasPoint()
-    {
-        RectangleF view = GetView();
-        float scale = GetScale();
-        float x = view.X + textInputPosition.X * scale;
-        float y = view.Y + textInputPosition.Y * scale;
-        string text = inlineText ?? string.Empty;
-        string composition = inlineCompositionText ?? string.Empty;
-        int caretIndex = GetInlineCaretIndex();
-        if ((text.Length > 0 && caretIndex > 0) || composition.Length > 0)
-        {
-            using (Graphics g = canvas.CreateGraphics())
-            using (Font font = new Font(AppStyles.UiFontName, Math.Max(1f, strokeWidth * 6f * scale), FontStyle.Bold))
-            using (StringFormat format = CreateInlineTextFormat())
-            {
-                if (composition.Length > 0)
-                {
-                    int selectionStart = Math.Max(0, Math.Min(text.Length, GetInlineSelectionStart()));
-                    int selectionLength = Math.Max(0, Math.Min(text.Length - selectionStart, GetInlineSelectionLength()));
-                    int insertionIndex = selectionLength > 0 ? selectionStart : caretIndex;
-                    x += MeasureInlineTextWidth(g, font, format, text, insertionIndex);
-                    x += MeasureInlineTextWidth(g, font, format, composition, composition.Length);
-                }
-                else
-                {
-                    x += MeasureInlineTextWidth(g, font, format, text, caretIndex);
-                }
-            }
-        }
-        return new Point((int)Math.Round(x), (int)Math.Round(y));
-    }
-
-    private void RestartInlineCaret()
-    {
-        inlineCaretVisible = true;
-        inlineCaretTimer.Stop();
-        inlineCaretTimer.Start();
-    }
-
-    private bool HandleInlineTextKeyDown(KeyEventArgs e)
-    {
-        if (e.Control && e.KeyCode == Keys.S)
-        {
-            HideInlineTextInput(true);
-            SaveAndClose();
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-            return true;
-        }
-
-        if (e.Control && e.KeyCode == Keys.A && inlineTextBox != null)
-        {
-            inlineTextBox.SelectAll();
-            SyncInlineTextInputState();
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-            return true;
-        }
-
-        if (e.KeyCode == Keys.Enter)
-        {
-            HideInlineTextInput(true);
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-            return true;
-        }
-
-        if (e.KeyCode == Keys.Escape)
-        {
-            HideInlineTextInput(false);
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-            return true;
-        }
-
-        return false;
-    }
-
-    private void Canvas_MouseMove(object sender, MouseEventArgs e)
-    {
-        if (panning)
-        {
-            viewOffset.X += e.Location.X - lastPanPoint.X;
-            viewOffset.Y += e.Location.Y - lastPanPoint.Y;
-            lastPanPoint = e.Location;
-            imePositionThrottle.Invoke();
-            RequestCanvasRender();
-            return;
-        }
-
-        if (inlineTextSelecting)
-        {
-            UpdateInlineTextSelection(ToImagePoint(e.Location));
-            return;
-        }
-
-        if (movingSelection || resizingSelection)
-        {
-            if (!HasSelectedItem())
-            {
-                ClearSelection();
-                canvas.Cursor = Cursors.Cross;
-                return;
-            }
-
-            PointF point = ToImagePoint(e.Location);
-            if (Distance(lastMovePoint, point) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels))
-            {
-                moveCurrentPoint = point;
-                lastMovePoint = point;
-                selectionMoved = Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
-                RequestCanvasRender();
-            }
-            canvas.Cursor = resizingSelection ? GetSelectionHandleCursor(activeSelectionHandle) : Cursors.SizeAll;
-            return;
-        }
-
-        if (!drawing)
-        {
-            PointF point = ToImagePoint(e.Location);
-            if (inlineTextEditing && IsPointInInlineTextInput(point))
-            {
-                canvas.Cursor = Cursors.IBeam;
-                return;
-            }
-
-            SelectionHandle hoverHandle = HitTestSelectionHandle(point);
-            if (hoverHandle != SelectionHandle.None)
-            {
-                canvas.Cursor = GetSelectionHandleCursor(hoverHandle);
-                return;
-            }
-
-            canvas.Cursor = HitTestAnnotation(point) >= 0 ? Cursors.SizeAll : Cursors.Cross;
-            return;
-        }
-
-        currentPoint = ToImagePoint(e.Location);
-        if (currentTool == ToolMode.Pen && currentPenItem != null)
-        {
-            if (AppendPenPointIfNeeded(currentPenItem, currentPoint, CanvasPixelsToImageDistance(PenSampleThresholdPixels)))
-            {
-                RequestCanvasRender();
-            }
-            return;
-        }
-        RequestCanvasRender();
-    }
-
-    private void Canvas_MouseUp(object sender, MouseEventArgs e)
-    {
-        if (e.Button == MouseButtons.Right)
-        {
-            panning = false;
-            canvas.Cursor = Cursors.Cross;
-            canvas.Capture = false;
-            return;
-        }
-
-        if (e.Button != MouseButtons.Left)
-        {
-            return;
-        }
-
-        if (inlineTextSelecting)
-        {
-            inlineTextSelecting = false;
-            canvas.Capture = false;
-            canvas.Cursor = Cursors.IBeam;
-            if (inlineTextBox != null)
-            {
-                inlineTextBox.Focus();
-            }
-            RequestCanvasRender();
-            return;
-        }
-
-        if (movingSelection || resizingSelection)
-        {
-            bool wasMovingSelection = movingSelection;
-            SelectionHandle resizeHandle = activeSelectionHandle;
-            AnnotationSnapshot before = selectionEditStartState;
-            RectangleF originalBounds = selectionEditStartBounds;
-            moveCurrentPoint = ToImagePoint(e.Location);
-            PointF offset = GetMoveOffset();
-            bool changed = selectionMoved || Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
-            if (changed && HasSelectedItem())
-            {
-                AnnotationItem item = items[selectedItemIndex];
-                if (before == null)
-                {
-                    before = CaptureAnnotation(item);
-                }
-
-                ApplyAnnotationSnapshot(item, before);
-                if (wasMovingSelection)
-                {
-                    MoveAnnotation(item, offset.X, offset.Y);
-                }
-                else
-                {
-                    ApplyResizeToAnnotation(item, before, originalBounds, resizeHandle, offset);
-                }
-
-                AnnotationSnapshot after = CaptureAnnotation(item);
-                changed = RecordTransformUndo(item, selectedItemIndex, before, after);
-            }
-            ResetSelectionEditState();
-            canvas.Cursor = Cursors.Cross;
-            canvas.Capture = false;
-            ResumeDisplayCacheAfterInteraction(changed);
-            RequestCanvasRender();
-            return;
-        }
-
-        if (!drawing)
-        {
-            return;
-        }
-
-        drawing = false;
-        canvas.Capture = false;
-        currentPoint = ToImagePoint(e.Location);
-        if (currentTool == ToolMode.Pen)
-        {
-            AppendPenPointIfNeeded(currentPenItem, currentPoint, 0.01f);
-            if (currentPenItem != null && IsMeaningfulAnnotation(currentPenItem))
-            {
-                AddAnnotation(currentPenItem);
-            }
-        }
-        else
-        {
-            var item = new AnnotationItem();
-            item.Tool = currentTool;
-            item.Start = startPoint;
-            item.End = currentPoint;
-            item.StrokeColor = strokeColor;
-            item.StrokeWidth = strokeWidth;
-            if (IsMeaningfulAnnotation(item))
-            {
-                AddAnnotation(item);
-            }
-        }
-        currentPenItem = null;
-        RequestCanvasRender();
-    }
-
-    private void AnnotatorForm_KeyDown(object sender, KeyEventArgs e)
-    {
-        if (inlineTextEditing)
-        {
-            return;
-        }
-
-        if (e.KeyCode == Keys.Delete || e.KeyCode == Keys.Back)
-        {
-            if (DeleteSelectedAnnotation())
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-            }
-        }
-        else if (e.Control && e.KeyCode == Keys.Z)
-        {
-            UndoAnnotationAction();
-        }
-        else if (e.Control && e.KeyCode == Keys.S)
-        {
-            SaveAndClose();
-        }
-        else if (e.KeyCode == Keys.Escape)
-        {
-            Close();
-        }
-        else if (e.KeyCode == Keys.D0 || e.KeyCode == Keys.F)
-        {
-            ResetZoom();
-        }
-        else if (e.KeyCode == Keys.D1)
-        {
-            currentTool = ToolMode.Rect;
-            UpdateToolButtons();
-        }
-        else if (e.KeyCode == Keys.D2)
-        {
-            currentTool = ToolMode.Arrow;
-            UpdateToolButtons();
-        }
-        else if (e.KeyCode == Keys.D3)
-        {
-            currentTool = ToolMode.Pen;
-            UpdateToolButtons();
-        }
-        else if (e.KeyCode == Keys.D4)
-        {
-            currentTool = ToolMode.Mosaic;
-            UpdateToolButtons();
-        }
-    }
-
     private Bitmap RenderFinalImage()
     {
         var result = new Bitmap(baseImage.Width, baseImage.Height);
@@ -2752,6 +1687,7 @@ internal static class Program
         AssertGraphicsTransformOrder();
         AssertAnnotationPointReplacementInvalidatesCache();
         AssertResizeTransform();
+        AssertMosaicLockBitsRendering();
 
         AssertMeaningful(new AnnotationItem
         {
@@ -2859,6 +1795,45 @@ internal static class Program
         AssertNear(item.Start.X, 10f, "resize transform left");
         AssertNear(item.End.X, 35f, "resize transform right");
         AssertNear(item.End.Y, 30f, "resize transform bottom");
+    }
+
+    private static void AssertMosaicLockBitsRendering()
+    {
+        var item = new AnnotationItem
+        {
+            Tool = ToolMode.Mosaic,
+            Start = new PointF(0, 0),
+            End = new PointF(36, 18)
+        };
+
+        using (var bitmap = new Bitmap(36, 18, PixelFormat.Format32bppArgb))
+        {
+            using (Graphics g = Graphics.FromImage(bitmap))
+            {
+                using (var red = new SolidBrush(Color.Red))
+                using (var green = new SolidBrush(Color.Lime))
+                {
+                    g.FillRectangle(red, 0, 0, 18, 18);
+                    g.FillRectangle(green, 18, 0, 18, 18);
+                }
+            }
+
+            var method = typeof(AnnotatorForm).GetMethod(
+                "ApplyMosaic",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            if (method == null)
+            {
+                throw new InvalidOperationException("Mosaic self test cannot find helper.");
+            }
+
+            method.Invoke(null, new object[] { bitmap, item });
+            Color left = bitmap.GetPixel(4, 4);
+            Color right = bitmap.GetPixel(22, 4);
+            if (left.R <= left.G || left.R <= left.B || right.G <= right.R || right.G <= right.B)
+            {
+                throw new InvalidOperationException("Mosaic lockbits self test failed.");
+            }
+        }
     }
 
     private static void AssertNear(float actual, float expected, string label)

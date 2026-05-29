@@ -53,6 +53,7 @@ if ($needsBuild) {
         "/nologo",
         "/target:winexe",
         "/platform:$platformName",
+        "/unsafe+",
         "/optimize+",
         "/out:$exe",
         "/r:System.Windows.Forms.dll",
