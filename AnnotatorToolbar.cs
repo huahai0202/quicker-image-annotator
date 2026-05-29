@@ -25,6 +25,7 @@ internal sealed partial class AnnotatorForm
             if (items.Count > 0)
             {
                 items.RemoveAt(items.Count - 1);
+                MarkAnnotationsChanged();
                 RequestCanvasRender();
             }
         });
@@ -32,6 +33,7 @@ internal sealed partial class AnnotatorForm
         {
             CancelInlineTextInput();
             items.Clear();
+            MarkAnnotationsChanged();
             RequestCanvasRender();
         });
         AddActionButton(ref toolbarX, ToolbarIconKind.Fit, "适合窗口", delegate
