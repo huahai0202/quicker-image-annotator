@@ -16,7 +16,7 @@ internal sealed class SettingsDialog : Form
         MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(520, 160);
+        ClientSize = new Size(620, 180);
         BackColor = Color.White;
         Font = new Font(AppStyles.UiFontName, 9f);
 
@@ -31,33 +31,33 @@ internal sealed class SettingsDialog : Form
 
         outputDirectoryBox.Left = 24;
         outputDirectoryBox.Top = 50;
-        outputDirectoryBox.Width = 350;
+        outputDirectoryBox.Width = 450;
         outputDirectoryBox.Height = 26;
         outputDirectoryBox.Text = outputDirectory ?? string.Empty;
         Controls.Add(outputDirectoryBox);
 
-        var browseButton = CreateDialogButton("浏览...", 386, 48);
+        var browseButton = CreateDialogButton("浏览...", 486, 48);
         browseButton.Click += delegate { BrowseOutputDirectory(); };
         Controls.Add(browseButton);
 
-        var clearButton = CreateDialogButton("清空", 386, 82);
+        var clearButton = CreateDialogButton("清空", 486, 82);
         clearButton.Click += delegate { outputDirectoryBox.Text = string.Empty; };
         Controls.Add(clearButton);
 
         var hint = new Label();
         hint.Left = 24;
         hint.Top = 86;
-        hint.Width = 350;
-        hint.Height = 22;
-        hint.Text = "留空：本地图片存原目录，剪贴板图片存临时目录";
+        hint.Width = 450;
+        hint.Height = 42;
+        hint.Text = "留空：本地图片存原目录，剪贴板图片存 " + GetClipboardTempDirectory();
         hint.ForeColor = Color.FromArgb(95, 101, 110);
         Controls.Add(hint);
 
-        var okButton = CreateDialogButton("保存", 304, 120);
+        var okButton = CreateDialogButton("保存", 404, 140);
         okButton.Click += delegate { SaveAndClose(); };
         Controls.Add(okButton);
 
-        var cancelButton = CreateDialogButton("取消", 394, 120);
+        var cancelButton = CreateDialogButton("取消", 494, 140);
         cancelButton.DialogResult = DialogResult.Cancel;
         Controls.Add(cancelButton);
 
@@ -80,6 +80,11 @@ internal sealed class SettingsDialog : Form
         button.Text = text;
         button.UseVisualStyleBackColor = true;
         return button;
+    }
+
+    private static string GetClipboardTempDirectory()
+    {
+        return Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
     private void BrowseOutputDirectory()
