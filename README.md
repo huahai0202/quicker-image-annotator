@@ -128,4 +128,4 @@ powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x86 -SelfTe
 
 这些文件应作为 GitHub Release 资产上传，不提交到源码树。
 
-更多设计和历史记录放在 [docs/superpowers/specs](docs/superpowers/specs)。
+项目说明和性能记录放在 [docs/superpowers/specs](docs/superpowers/specs)。

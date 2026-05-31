@@ -4,6 +4,9 @@ using System.Runtime.InteropServices;
 
 internal sealed class GpuRenderer : IDisposable
 {
+    private const int TextBoundsCacheLimit = 256;
+    private static readonly object TextBoundsCacheSync = new object();
+    private static readonly Dictionary<string, GpuRect> TextBoundsCache = new Dictionary<string, GpuRect>(StringComparer.Ordinal);
     private readonly IntPtr factory;
     private readonly IntPtr writeFactory;
     private readonly IntPtr target;
@@ -14,6 +17,8 @@ internal sealed class GpuRenderer : IDisposable
     private readonly int sourceHeight;
     private readonly Dictionary<int, IntPtr> brushes = new Dictionary<int, IntPtr>();
     private readonly Dictionary<string, IntPtr> textFormats = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
+    private readonly Dictionary<string, TextLayoutCache> textLayouts = new Dictionary<string, TextLayoutCache>(StringComparer.Ordinal);
+    private TextLayoutCache editingTextLayout;
     private bool disposed;
 
     private GpuRenderer(
@@ -284,7 +289,6 @@ internal sealed class GpuRenderer : IDisposable
 
         const float block = 18f;
         IntPtr shade = GetBrush(AppStyles.OverlayShade);
-        IntPtr dark = GetBrush(Rgba.FromArgb(190, 0, 0, 0));
         for (float y = rect.Top; y < rect.Bottom; y += block)
         {
             for (float x = rect.Left; x < rect.Right; x += block)
@@ -298,7 +302,6 @@ internal sealed class GpuRenderer : IDisposable
                     1f,
                     1f);
                 D2DApi.DrawImageSection(target, sourceImage, destination, source, D2DApi.InterpolationNearest);
-                D2DApi.FillRectangle(target, destination, dark);
             }
         }
         D2DApi.FillRectangle(target, rect, shade);
@@ -352,30 +355,74 @@ internal sealed class GpuRenderer : IDisposable
         }
         float em = Math.Max(1f, strokeWidth * 6f);
         IntPtr brush = GetBrush(rgba);
-        IntPtr format = GetTextFormat(AppStyles.UiFontName, em);
-        GpuRect layout = new GpuRect(origin.X, origin.Y, Math.Max(80f, sourceWidth - origin.X), Math.Max(em * 1.5f, sourceHeight - origin.Y));
+        TextLayoutCache textLayout = null;
         if (editing)
         {
-            DrawTextEditingChrome(text, origin, em, item);
+            textLayout = GetEditingTextLayout(text, em);
+            DrawTextEditingChrome(textLayout, origin, em, item);
         }
         if (text.Length > 0)
         {
-            D2DApi.DrawText(target, text, format, layout, brush);
+            if (editing && textLayout != null)
+            {
+                D2DApi.DrawTextLayout(target, origin, textLayout.Layout, brush);
+            }
+            else if (item != null)
+            {
+                TextLayoutCache layout = item.GetTextLayout(em, Math.Max(80f, sourceWidth - origin.X), Math.Max(em * 1.5f, sourceHeight - origin.Y));
+                if (layout != null)
+                {
+                    D2DApi.DrawTextLayout(target, origin, layout.Layout, brush);
+                }
+                else
+                {
+                    IntPtr format = GetTextFormat(AppStyles.UiFontName, em);
+                    GpuRect fallback = new GpuRect(origin.X, origin.Y, Math.Max(80f, sourceWidth - origin.X), Math.Max(em * 1.5f, sourceHeight - origin.Y));
+                    D2DApi.DrawText(target, text, format, fallback, brush);
+                }
+            }
+            else
+            {
+                IntPtr format = GetTextFormat(AppStyles.UiFontName, em);
+                GpuRect fallback = new GpuRect(origin.X, origin.Y, Math.Max(80f, sourceWidth - origin.X), Math.Max(em * 1.5f, sourceHeight - origin.Y));
+                D2DApi.DrawText(target, text, format, fallback, brush);
+            }
         }
         if (editing)
         {
-            DrawTextCaret(text, origin, em, rgba, item);
+            DrawTextCaret(textLayout, origin, em, rgba, item);
         }
     }
 
-    private void DrawTextEditingChrome(string text, GpuPoint origin, float em, AnnotationItem item)
+    private TextLayoutCache GetEditingTextLayout(string text, float em)
     {
+        string normalized = text ?? string.Empty;
+        if (editingTextLayout != null &&
+            string.Equals(editingTextLayout.Text, normalized, StringComparison.Ordinal) &&
+            Math.Abs(editingTextLayout.Em - Math.Max(1f, em)) < 0.001f)
+        {
+            return editingTextLayout;
+        }
+        if (editingTextLayout != null)
+        {
+            editingTextLayout.Dispose();
+            editingTextLayout = null;
+        }
+        editingTextLayout = new TextLayoutCache(normalized, em, sourceWidth, sourceHeight);
+        return editingTextLayout;
+    }
+
+    private void DrawTextEditingChrome(TextLayoutCache textLayout, GpuPoint origin, float em, AnnotationItem item)
+    {
+        string text = textLayout == null ? string.Empty : textLayout.Text;
         int selectionStart = Math.Min(ClampTextIndex(text, item.TextCaretIndex), ClampTextIndex(text, item.TextSelectionAnchor));
         int selectionEnd = Math.Max(ClampTextIndex(text, item.TextCaretIndex), ClampTextIndex(text, item.TextSelectionAnchor));
         if (selectionEnd > selectionStart)
         {
-            float x = origin.X + MeasureTextPrefixWidth(text, em, selectionStart);
-            float width = Math.Max(1f, MeasureTextPrefixWidth(text, em, selectionEnd) - MeasureTextPrefixWidth(text, em, selectionStart));
+            GpuPoint start = textLayout.HitTestTextPosition(selectionStart, false);
+            GpuPoint end = textLayout.HitTestTextPosition(selectionEnd, false);
+            float x = origin.X + start.X;
+            float width = Math.Max(1f, end.X - start.X);
             D2DApi.FillRoundedRectangle(target, new GpuRect(x, origin.Y + em * 0.05f, width, em * 1.18f), 2f, GetBrush(Rgba.FromArgb(72, AppStyles.Accent.R, AppStyles.Accent.G, AppStyles.Accent.B)));
         }
 
@@ -385,35 +432,28 @@ internal sealed class GpuRenderer : IDisposable
             int compEnd = ClampTextIndex(text, item.TextCompositionStart + item.TextCompositionLength);
             if (compEnd > compStart)
             {
-                float startX = origin.X + MeasureTextPrefixWidth(text, em, compStart);
-                float endX = origin.X + MeasureTextPrefixWidth(text, em, compEnd);
+                GpuPoint start = textLayout.HitTestTextPosition(compStart, false);
+                GpuPoint end = textLayout.HitTestTextPosition(compEnd, false);
+                float startX = origin.X + start.X;
+                float endX = origin.X + end.X;
                 float y = origin.Y + em * 1.25f;
                 D2DApi.DrawLine(target, new GpuPoint(startX, y), new GpuPoint(Math.Max(startX + 1f, endX), y), GetBrush(AppStyles.Accent), Math.Max(1f, em / 15f), roundStroke);
             }
         }
     }
 
-    private void DrawTextCaret(string text, GpuPoint origin, float em, Rgba rgba, AnnotationItem item)
+    private void DrawTextCaret(TextLayoutCache textLayout, GpuPoint origin, float em, Rgba rgba, AnnotationItem item)
     {
-        if (!item.TextCaretVisible)
+        if (!item.TextCaretVisible || textLayout == null)
         {
             return;
         }
-        int caret = ClampTextIndex(text, item.TextCaretIndex);
-        float x = origin.X + MeasureTextPrefixWidth(text, em, caret);
+        int caret = ClampTextIndex(textLayout.Text, item.TextCaretIndex);
+        GpuPoint caretPoint = textLayout.HitTestTextPosition(caret, false);
+        float x = origin.X + caretPoint.X;
         float top = origin.Y + em * 0.05f;
         float bottom = origin.Y + em * 1.25f;
         D2DApi.DrawLine(target, new GpuPoint(x, top), new GpuPoint(x, bottom), GetBrush(rgba), Math.Max(1.25f, em / 15f), roundStroke);
-    }
-
-    private static float MeasureTextPrefixWidth(string text, float em, int length)
-    {
-        length = Math.Max(0, Math.Min(text == null ? 0 : text.Length, length));
-        if (length == 0)
-        {
-            return 0f;
-        }
-        return MeasureTextBounds(text.Substring(0, length), em).Width;
     }
 
     private static int ClampTextIndex(string text, int index)
@@ -640,7 +680,7 @@ internal sealed class GpuRenderer : IDisposable
         GpuRect rect = new GpuRect(x, y, width, height);
         D2DApi.FillRoundedRectangle(target, rect, 7f, GetBrush(Rgba.White));
         D2DApi.DrawRoundedRectangle(target, rect, 7f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
-        D2DApi.DrawText(target, text, GetTextFormat(AppStyles.UiFontName, 12f), new GpuRect(rect.X + 9, rect.Y + 7, rect.Width - 18, rect.Height - 8), GetBrush(AppStyles.ToolbarIcon));
+        DrawUiTextLayout(text, 12f, rect.X + 9f, rect.Y + 7f, rect.Width - 18f, rect.Height - 8f, GetBrush(AppStyles.ToolbarIcon));
     }
 
     private void DrawToolOptions(ToolMode tool, Rgba stroke, float strokeWidth, float opacity)
@@ -722,14 +762,14 @@ internal sealed class GpuRenderer : IDisposable
         D2DApi.FillRoundedRectangle(target, new GpuRect(panel.X + 1, panel.Y + 8, panel.Width, panel.Height), 8f, GetBrush(Rgba.FromArgb(42, 0, 0, 0)));
         D2DApi.FillRoundedRectangle(target, panel, 8f, GetBrush(Rgba.White));
         D2DApi.DrawRoundedRectangle(target, panel, 8f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
-        D2DApi.DrawText(target, UiText.SaveDirectory, GetTextFormat(AppStyles.UiFontName, 15f), new GpuRect(panel.X + 24, panel.Y + 20, panel.Width - 48, 26), GetBrush(AppStyles.ToolbarIcon));
+        DrawUiTextLayout(UiText.SaveDirectory, 15f, panel.X + 24f, panel.Y + 20f, panel.Width - 48f, 26f, GetBrush(AppStyles.ToolbarIcon));
         string value = overlay.OutputDirectory ?? string.Empty;
         GpuRect field = GetSettingsOutputRect(panel);
         D2DApi.FillRoundedRectangle(target, field, 5f, GetBrush(AppStyles.FieldBack));
         D2DApi.DrawRoundedRectangle(target, field, 5f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
-        D2DApi.DrawText(target, value, GetTextFormat(AppStyles.UiFontName, 12f), new GpuRect(field.X + 11, field.Y + 8, field.Width - 22, field.Height - 10), GetBrush(AppStyles.ToolbarIcon));
+        DrawUiTextLayout(value, 12f, field.X + 11f, field.Y + 8f, field.Width - 22f, field.Height - 10f, GetBrush(AppStyles.ToolbarIcon));
         string hint = UiText.EmptyOutputDirectoryHintPrefix + GetClipboardTempDirectory();
-        D2DApi.DrawText(target, hint, GetTextFormat(AppStyles.UiFontName, 12f), new GpuRect(field.X, field.Bottom + 10, panel.Width - 48, 34), GetBrush(AppStyles.MutedText));
+        DrawUiTextLayout(hint, 12f, field.X, field.Bottom + 10f, panel.Width - 48f, 34f, GetBrush(AppStyles.MutedText));
         DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Browse), UiText.Browse, AppStyles.Accent, false);
         DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Clear), UiText.Clear, AppStyles.ToolbarIcon, false);
         DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Save), UiText.Save, AppStyles.SaveAccent, true);
@@ -742,7 +782,7 @@ internal sealed class GpuRenderer : IDisposable
         Rgba textColor = primary ? Rgba.White : color;
         D2DApi.FillRoundedRectangle(target, rect, 5f, GetBrush(fill));
         D2DApi.DrawRoundedRectangle(target, rect, 5f, GetBrush(color), primary ? 0.8f : 1.2f, roundStroke);
-        D2DApi.DrawText(target, text, GetTextFormat(AppStyles.UiFontName, 13f), new GpuRect(rect.X + 10, rect.Y + 8, rect.Width - 20, rect.Height - 10), GetBrush(textColor));
+        DrawUiTextLayout(text, 13f, rect.X + 10f, rect.Y + 8f, rect.Width - 20f, rect.Height - 10f, GetBrush(textColor));
     }
 
     public static GpuRect GetSettingsOverlayPanel(int clientWidth, int clientHeight)
@@ -827,6 +867,35 @@ internal sealed class GpuRenderer : IDisposable
         return format;
     }
 
+    private void DrawUiTextLayout(string text, float em, float x, float y, float width, float height, IntPtr brush)
+    {
+        TextLayoutCache layout = GetUiTextLayout(text, em, width, height);
+        D2DApi.DrawTextLayout(target, new GpuPoint(x, y), layout.Layout, brush);
+    }
+
+    private TextLayoutCache GetUiTextLayout(string text, float em, float width, float height)
+    {
+        string normalized = text ?? string.Empty;
+        string key = normalized + "\0" + em.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "\0" + Math.Max(1f, width).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "\0" + Math.Max(1f, height).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        TextLayoutCache layout;
+        if (textLayouts.TryGetValue(key, out layout))
+        {
+            return layout;
+        }
+
+        layout = new TextLayoutCache(normalized, em, width, height);
+        if (textLayouts.Count >= 64)
+        {
+            foreach (TextLayoutCache cached in textLayouts.Values)
+            {
+                cached.Dispose();
+            }
+            textLayouts.Clear();
+        }
+        textLayouts[key] = layout;
+        return layout;
+    }
+
     public void Dispose()
     {
         if (disposed)
@@ -846,6 +915,16 @@ internal sealed class GpuRenderer : IDisposable
             ComUtil.Release(ref local);
         }
         textFormats.Clear();
+        foreach (TextLayoutCache layout in textLayouts.Values)
+        {
+            layout.Dispose();
+        }
+        textLayouts.Clear();
+        if (editingTextLayout != null)
+        {
+            editingTextLayout.Dispose();
+            editingTextLayout = null;
+        }
         IntPtr localSource = sourceImage;
         IntPtr localTarget = target;
         IntPtr localWrite = writeFactory;
@@ -925,33 +1004,39 @@ internal sealed class GpuRenderer : IDisposable
             return new GpuRect(0, 0, em, em);
         }
 
-        IntPtr factory = IntPtr.Zero;
+        string key = text + "\0" + Math.Max(1f, em).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        GpuRect cachedBounds;
+        if (TryGetCachedTextBounds(key, out cachedBounds))
+        {
+            return cachedBounds;
+        }
+
         IntPtr format = IntPtr.Zero;
         IntPtr layout = IntPtr.Zero;
         try
         {
-            factory = DWriteApi.CreateFactory();
+            IntPtr factory = DWriteApi.GetSharedFactory();
             format = DWriteApi.CreateTextFormat(factory, AppStyles.UiFontName, Math.Max(1f, em));
             layout = DWriteApi.CreateTextLayout(factory, text, format, 100000f, 10000f);
             DWriteApi.TextMetrics metrics = DWriteApi.GetMetrics(layout);
-            return new GpuRect(metrics.left, metrics.top, Math.Max(1f, metrics.widthIncludingTrailingWhitespace), Math.Max(1f, metrics.height));
+            GpuRect bounds = new GpuRect(metrics.left, metrics.top, Math.Max(1f, metrics.widthIncludingTrailingWhitespace), Math.Max(1f, metrics.height));
+            CacheTextBounds(key, bounds);
+            return bounds;
         }
         finally
         {
             ComUtil.Release(ref layout);
             ComUtil.Release(ref format);
-            ComUtil.Release(ref factory);
         }
     }
 
     public static TextHitResult HitTestText(string text, float em, GpuPoint point)
     {
-        IntPtr factory = IntPtr.Zero;
         IntPtr format = IntPtr.Zero;
         IntPtr layout = IntPtr.Zero;
         try
         {
-            factory = DWriteApi.CreateFactory();
+            IntPtr factory = DWriteApi.GetSharedFactory();
             format = DWriteApi.CreateTextFormat(factory, AppStyles.UiFontName, Math.Max(1f, em));
             layout = DWriteApi.CreateTextLayout(factory, text ?? string.Empty, format, 100000f, 10000f);
             return DWriteApi.HitTestPoint(layout, point.X, point.Y);
@@ -960,7 +1045,26 @@ internal sealed class GpuRenderer : IDisposable
         {
             ComUtil.Release(ref layout);
             ComUtil.Release(ref format);
-            ComUtil.Release(ref factory);
+        }
+    }
+
+    private static bool TryGetCachedTextBounds(string key, out GpuRect bounds)
+    {
+        lock (TextBoundsCacheSync)
+        {
+            return TextBoundsCache.TryGetValue(key, out bounds);
+        }
+    }
+
+    private static void CacheTextBounds(string key, GpuRect bounds)
+    {
+        lock (TextBoundsCacheSync)
+        {
+            if (TextBoundsCache.Count >= TextBoundsCacheLimit)
+            {
+                TextBoundsCache.Clear();
+            }
+            TextBoundsCache[key] = bounds;
         }
     }
 

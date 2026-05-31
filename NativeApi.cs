@@ -45,6 +45,7 @@ internal static class Win32Api
 {
     public const int CwUseDefault = unchecked((int)0x80000000);
     public const int SwShow = 5;
+    public const int WsExLayered = 0x00080000;
     public const int WmDestroy = 0x0002;
     public const int WmPaint = 0x000F;
     public const int WmClose = 0x0010;
@@ -85,6 +86,7 @@ internal static class Win32Api
     public const int VkX = 0x58;
     public const int VkZ = 0x5A;
     public const int VkS = 0x53;
+    public const int GwlExStyle = -20;
     public const int GwlpUserData = -21;
     public const int IdcArrow = 32512;
     public const int IdcIBeam = 32513;
@@ -99,6 +101,7 @@ internal static class Win32Api
     public const int IconBig = 1;
     public const uint ImageIcon = 1;
     public const uint LrLoadFromFile = 0x00000010;
+    public const uint LwaAlpha = 0x00000002;
     public const uint MbIconError = 0x00000010;
     public const uint MbIconWarning = 0x00000030;
     public const uint MbOk = 0x00000000;
@@ -116,6 +119,9 @@ internal static class Win32Api
     public static readonly IntPtr HwndNoTopMost = new IntPtr(-2);
     public const uint SwpNoMove = 0x0002;
     public const uint SwpNoSize = 0x0001;
+    public const uint SwpNoZOrder = 0x0004;
+    public const uint SwpNoActivate = 0x0010;
+    public const uint SwpFrameChanged = 0x0020;
 
     public delegate IntPtr WindowProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
 
@@ -242,6 +248,21 @@ internal static class Win32Api
     [DllImport("user32.dll")]
     public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
 
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll", EntryPoint = "CreateCompatible" + "Bit" + "map")]
+    public static extern IntPtr CreateCompatibleSurface(IntPtr hdc, int cx, int cy);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteObject(IntPtr obj);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteDC(IntPtr hdc);
+
     [DllImport("user32.dll")]
     public static extern bool GetMessage(out Msg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
@@ -311,8 +332,17 @@ internal static class Win32Api
     [DllImport("user32.dll")]
     public static extern IntPtr SetCursor(IntPtr hCursor);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
     [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+    private static extern IntPtr GetWindowLong32(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+    private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
     private static extern IntPtr SetWindowLong32(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
@@ -402,6 +432,16 @@ internal static class Win32Api
         return IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, GwlpUserData, value) : SetWindowLong32(hwnd, GwlpUserData, value);
     }
 
+    public static IntPtr GetWindowLongPtr(IntPtr hwnd, int index)
+    {
+        return IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, index) : GetWindowLong32(hwnd, index);
+    }
+
+    public static IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value)
+    {
+        return IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, index, value) : SetWindowLong32(hwnd, index, value);
+    }
+
     public static bool SetWindowTextUnicode(IntPtr hwnd, string text)
     {
         IntPtr pointer = Marshal.StringToHGlobalUni(text ?? string.Empty);
@@ -448,6 +488,9 @@ internal static class Win32Api
 
 internal static class DWriteApi
 {
+    private static readonly object SharedFactorySync = new object();
+    private static IntPtr sharedFactory;
+
     private const int FactoryTypeShared = 0;
     private const int WeightBold = 700;
     private const int StyleNormal = 0;
@@ -493,6 +536,28 @@ internal static class DWriteApi
         return factory;
     }
 
+    public static IntPtr GetSharedFactory()
+    {
+        lock (SharedFactorySync)
+        {
+            if (sharedFactory == IntPtr.Zero)
+            {
+                sharedFactory = CreateFactory();
+            }
+            return sharedFactory;
+        }
+    }
+
+    public static void ReleaseSharedFactory()
+    {
+        lock (SharedFactorySync)
+        {
+            IntPtr factory = sharedFactory;
+            sharedFactory = IntPtr.Zero;
+            ComUtil.Release(ref factory);
+        }
+    }
+
     public static IntPtr CreateTextFormat(IntPtr factory, string family, float em)
     {
         IntPtr format;
@@ -532,6 +597,16 @@ internal static class DWriteApi
         return result;
     }
 
+    public static GpuPoint HitTestTextPosition(IntPtr layout, int textPosition, bool trailing)
+    {
+        float pointX;
+        float pointY;
+        HitTestMetrics metrics;
+        HitTestTextPositionDelegate hit = ComUtil.GetDelegate<HitTestTextPositionDelegate>(layout, 65);
+        ComUtil.Check(hit(layout, (uint)Math.Max(0, textPosition), trailing ? 1 : 0, out pointX, out pointY, out metrics), "TextLayout.HitTestTextPosition");
+        return new GpuPoint(pointX, pointY);
+    }
+
     [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
     private delegate int CreateTextFormatDelegate(
         IntPtr self,
@@ -564,6 +639,15 @@ internal static class DWriteApi
         float y,
         out int isTrailingHit,
         out int isInside,
+        out HitTestMetrics metrics);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int HitTestTextPositionDelegate(
+        IntPtr self,
+        uint textPosition,
+        int isTrailingHit,
+        out float pointX,
+        out float pointY,
         out HitTestMetrics metrics);
 }
 
@@ -1042,6 +1126,12 @@ internal static class D2DApi
         draw(target, text, (uint)text.Length, format, ref rect, brush, 0, 0);
     }
 
+    public static void DrawTextLayout(IntPtr target, GpuPoint origin, IntPtr textLayout, IntPtr brush)
+    {
+        DrawTextLayoutDelegate draw = ComUtil.GetDelegate<DrawTextLayoutDelegate>(target, 28);
+        draw(target, Point2.FromPoint(origin), textLayout, brush, 0);
+    }
+
     private static TargetProperties CreateTargetProperties(int type, int alpha)
     {
         TargetProperties p = new TargetProperties();
@@ -1108,4 +1198,6 @@ internal static class D2DApi
     private delegate void FillPathDelegate(IntPtr self, IntPtr path, IntPtr brush, IntPtr opacityBrush);
     [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
     private delegate void DrawTextDelegate(IntPtr self, [MarshalAs(UnmanagedType.LPWStr)] string text, uint len, IntPtr format, ref RectF layout, IntPtr brush, int options, int measuringMode);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void DrawTextLayoutDelegate(IntPtr self, Point2 origin, IntPtr textLayout, IntPtr brush, int options);
 }

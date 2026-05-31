@@ -11,6 +11,8 @@ internal static class RenderPerformanceProbe
     public const string Direct2DAnnotationDraw = "Direct2DAnnotationDraw";
     public const string FinalImageRender = "FinalImageRender";
     public const string FrameInterval = "FrameInterval";
+    public const string LaunchToFirstFrame = "LaunchToFirstFrame";
+    public const string InputToFrame = "InputToFrame";
 
     private const int MaxSamplesPerMetric = 2048;
     private const int DefaultSummaryIntervalFrames = 120;
@@ -69,6 +71,22 @@ internal static class RenderPerformanceProbe
 
         long elapsedTicks = Math.Max(0, Stopwatch.GetTimestamp() - startTimestamp);
         RecordTicks(metricName, elapsedTicks);
+    }
+
+    public static void RecordSince(string metricName, long startTimestamp)
+    {
+        if (startTimestamp == 0)
+        {
+            return;
+        }
+
+        long elapsedTicks = Math.Max(0, Stopwatch.GetTimestamp() - startTimestamp);
+        double elapsedMs = TicksToMilliseconds(elapsedTicks);
+        AppLog.Info(metricName + ": " + elapsedMs.ToString("0.###", CultureInfo.InvariantCulture) + " ms");
+        if (enabled)
+        {
+            RecordTicks(metricName, elapsedTicks);
+        }
     }
 
     public static void MarkFrameStart()

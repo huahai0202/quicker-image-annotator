@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -36,6 +37,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private static readonly IntPtr ToolOptionsTimerId = new IntPtr(101);
     private static readonly IntPtr ToolOptionsAnimationTimerId = new IntPtr(102);
     private static readonly IntPtr TextCaretTimerId = new IntPtr(103);
+    private static readonly IntPtr FirstFrameFadeTimerId = new IntPtr(104);
     private static readonly Dictionary<IntPtr, GpuAnnotatorWindow> Windows = new Dictionary<IntPtr, GpuAnnotatorWindow>();
     private static Win32Api.WindowProc sharedProc;
     private static IntPtr largeIcon;
@@ -44,6 +46,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private readonly WicImageDocument image;
     private readonly string imagePath;
     private string outputDirectory;
+    private long startupTimestamp;
     private readonly List<AnnotationItem> items = new List<AnnotationItem>();
     private readonly Stack<AnnotationUndoAction> undoStack = new Stack<AnnotationUndoAction>();
     private GpuRenderer renderer;
@@ -67,6 +70,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private int editingTextIndex = -1;
     private AnnotationSnapshot editingTextStartState;
     private GpuPoint textOrigin;
+    private TextLayoutCache inlineTextLayout;
     private GpuPoint startPoint;
     private GpuPoint currentPoint;
     private GpuPoint lastPan;
@@ -87,24 +91,32 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private int toolOptionsAnimationStartTick;
     private float toolOptionsAnimationStartOpacity;
     private float toolOptionsAnimationTargetOpacity;
+    private int hoverStateVersion;
+    private int cachedHoverVersion = -1;
+    private int cachedHoverX = int.MinValue;
+    private int cachedHoverY = int.MinValue;
+    private int cachedHoverCursorId = Win32Api.IdcArrow;
     private int consecutiveRenderFailures;
     private bool fatalErrorShown;
     private bool disposed;
+    private long inputToFrameTimestamp;
+    private bool firstFrameFadeStarted;
+    private byte firstFrameOpacity = 255;
 
-    public GpuAnnotatorWindow(string imagePath, WicImageDocument image, string outputDirectory)
+    public GpuAnnotatorWindow(string imagePath, WicImageDocument image, string outputDirectory, long startupTimestamp)
     {
         this.imagePath = imagePath;
         this.image = image;
         this.outputDirectory = outputDirectory;
+        this.startupTimestamp = startupTimestamp;
     }
 
     public int Run()
     {
         EnsureWindowClass();
-        renderer = GpuRenderer.CreateForWindow(image);
         GpuExtent extent = GetInitialWindowExtent();
         hwnd = Win32Api.CreateWindowEx(
-            0,
+            Win32Api.WsExLayered,
             WindowClassName,
             UiText.AppName,
             Win32Api.WsOverlappedWindow,
@@ -125,7 +137,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         SetWindowIcons(hwnd);
         Win32Api.SetWindowTextUnicode(hwnd, UiText.AppName);
         Win32Api.SetUserData(hwnd, GCHandle.ToIntPtr(GCHandle.Alloc(this)));
-        PrimeFirstFrame();
+        Win32Api.SetLayeredWindowAttributes(hwnd, 0, 0, Win32Api.LwaAlpha);
+        WarmUpRenderer();
         Win32Api.ShowWindow(hwnd, Win32Api.SwShow);
         Win32Api.UpdateWindow(hwnd);
 
@@ -298,6 +311,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     {
         Win32Api.PaintStruct ps;
         IntPtr hdc = Win32Api.BeginPaint(hwnd, out ps);
+        bool frameRendered = false;
         try
         {
             Win32Api.NativeRect rect;
@@ -312,7 +326,18 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                     renderer = GpuRenderer.CreateForWindow(image);
                 }
                 renderer.RenderToHdc(hdc, width, height, GetView(width, height), items, GetPreviewItem(), selectedIndex, true, currentTool, stroke, strokeWidth, settingsOverlay);
+                if (startupTimestamp != 0)
+                {
+                    RenderPerformanceProbe.RecordSince(RenderPerformanceProbe.LaunchToFirstFrame, startupTimestamp);
+                    startupTimestamp = 0;
+                }
+                if (inputToFrameTimestamp != 0)
+                {
+                    RenderPerformanceProbe.RecordSince(RenderPerformanceProbe.InputToFrame, inputToFrameTimestamp);
+                    inputToFrameTimestamp = 0;
+                }
                 consecutiveRenderFailures = 0;
+                frameRendered = true;
             }
             catch (Exception ex)
             {
@@ -322,11 +347,16 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         finally
         {
             Win32Api.EndPaint(hwnd, ref ps);
+            if (frameRendered)
+            {
+                StartFirstFrameFadeIn();
+            }
         }
     }
 
     private void MouseDown(int x, int y)
     {
+        MarkInputToFrame();
         if (settingsOverlay.Visible)
         {
             HandleSettingsOverlayClick(x, y);
@@ -404,6 +434,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseDoubleClick(int x, int y)
     {
+        MarkInputToFrame();
         if (settingsOverlay.Visible || y < AppStyles.ToolbarHeight)
         {
             return;
@@ -442,9 +473,13 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             viewOffset.X += x - lastPan.X;
             viewOffset.Y += y - lastPan.Y;
             lastPan = new GpuPoint(x, y);
+            InvalidateHoverCache();
             RequestPaint();
             return;
         }
+        GpuPoint clientPoint = new GpuPoint(x, y);
+        GpuRect view = GetView();
+        GpuPoint imagePoint = ToImagePoint(clientPoint, view);
         if (movingSelection || resizingSelection)
         {
             cursorId = movingSelection ? Win32Api.IdcSizeAll : GetCursorForSelectionHandle(activeSelectionHandle);
@@ -454,23 +489,23 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 return;
             }
 
-            GpuPoint point = ToImagePoint(x, y);
-            if (Distance(lastMovePoint, point) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels))
+            if (Distance(lastMovePoint, imagePoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels))
             {
-                moveCurrentPoint = point;
-                lastMovePoint = point;
+                moveCurrentPoint = imagePoint;
+                lastMovePoint = imagePoint;
                 selectionMoved = Distance(moveStartPoint, moveCurrentPoint) >= CanvasPixelsToImageDistance(MoveSampleThresholdPixels);
                 ApplyActiveSelectionEdit();
+                InvalidateHoverCache();
                 RequestPaint();
             }
             return;
         }
         if (!drawing)
         {
-            cursorId = GetHoverCursorId(x, y);
+            cursorId = GetHoverCursorId(clientPoint, view);
             return;
         }
-        currentPoint = ToImagePoint(x, y);
+        currentPoint = imagePoint;
         if (currentTool == ToolMode.Pen && currentPen != null)
         {
             GpuPoint[] points = currentPen.GetDrawingPoints();
@@ -485,19 +520,25 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseUp(int x, int y)
     {
+        MarkInputToFrame();
+        GpuPoint clientPoint = new GpuPoint(x, y);
+        GpuRect view = GetView();
+        GpuPoint imagePoint = ToImagePoint(clientPoint, view);
         if (selectingInlineText)
         {
-            SetInlineTextCaretFromPoint(ToImagePoint(x, y), true);
+            SetInlineTextCaretFromPoint(imagePoint, true);
             selectingInlineText = false;
             cursorId = Win32Api.IdcIBeam;
+            InvalidateHoverCache();
             Win32Api.ReleaseCapture();
             RequestPaint();
             return;
         }
         if (movingSelection || resizingSelection)
         {
-            FinishSelectionEdit(ToImagePoint(x, y));
-            cursorId = GetHoverCursorId(x, y);
+            FinishSelectionEdit(imagePoint);
+            cursorId = GetHoverCursorId(clientPoint, view);
+            InvalidateHoverCache();
             Win32Api.ReleaseCapture();
             RequestPaint();
             return;
@@ -507,7 +548,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             Win32Api.ReleaseCapture();
             return;
         }
-        currentPoint = ToImagePoint(x, y);
+        currentPoint = imagePoint;
         AnnotationItem item = GetPreviewItem();
         if (IsMeaningfulAnnotation(item))
         {
@@ -515,41 +556,51 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         }
         currentPen = null;
         drawing = false;
-        cursorId = GetHoverCursorId(x, y);
+        cursorId = GetHoverCursorId(clientPoint, view);
+        InvalidateHoverCache();
         Win32Api.ReleaseCapture();
         RequestPaint();
     }
 
-    private int GetHoverCursorId(int x, int y)
+    private int GetHoverCursorId(GpuPoint clientPoint, GpuRect view)
     {
+        int x = (int)clientPoint.X;
+        int y = (int)clientPoint.Y;
+        if (cachedHoverVersion == hoverStateVersion &&
+            cachedHoverX == x &&
+            cachedHoverY == y)
+        {
+            return cachedHoverCursorId;
+        }
+
         if (settingsOverlay.Visible || y < AppStyles.ToolbarHeight)
         {
-            return Win32Api.IdcArrow;
+            return CacheHoverCursor(x, y, Win32Api.IdcArrow);
         }
         if (settingsOverlay.ToolOptionsVisible && GpuRenderer.GetToolOptionsPanelRect().Contains(new GpuPoint(x, y)))
         {
-            return Win32Api.IdcArrow;
+            return CacheHoverCursor(x, y, Win32Api.IdcArrow);
+        }
+        if (!view.Contains(clientPoint))
+        {
+            return CacheHoverCursor(x, y, Win32Api.IdcArrow);
         }
 
-        GpuPoint imagePoint = ToImagePoint(x, y);
+        GpuPoint imagePoint = ToImagePoint(clientPoint, view);
         if (textEditing && IsPointInInlineTextEditBounds(imagePoint))
         {
-            return Win32Api.IdcIBeam;
+            return CacheHoverCursor(x, y, Win32Api.IdcIBeam);
         }
         SelectionHandle handle = HitTestSelectionHandle(imagePoint);
         if (handle != SelectionHandle.None)
         {
-            return GetCursorForSelectionHandle(handle);
+            return CacheHoverCursor(x, y, GetCursorForSelectionHandle(handle));
         }
         if (HitTestAnnotation(imagePoint) >= 0)
         {
-            return Win32Api.IdcSizeAll;
+            return CacheHoverCursor(x, y, Win32Api.IdcSizeAll);
         }
-        if (!GetView().Contains(new GpuPoint(x, y)))
-        {
-            return Win32Api.IdcArrow;
-        }
-        return currentTool == ToolMode.Text ? Win32Api.IdcIBeam : Win32Api.IdcCross;
+        return CacheHoverCursor(x, y, currentTool == ToolMode.Text ? Win32Api.IdcIBeam : Win32Api.IdcCross);
     }
 
     private static int GetCursorForSelectionHandle(SelectionHandle handle)
@@ -578,6 +629,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseWheel(int delta, IntPtr lParam)
     {
+        MarkInputToFrame();
         Win32Api.NativePoint p = new Win32Api.NativePoint();
         p.x = Win32Api.GetX(lParam);
         p.y = Win32Api.GetY(lParam);
@@ -593,6 +645,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void KeyDown(int key)
     {
+        MarkInputToFrame();
         bool ctrl = (Win32Api.GetKeyState(Win32Api.VkControl) & 0x8000) != 0;
         bool shift = (Win32Api.GetKeyState(Win32Api.VkShift) & 0x8000) != 0;
         if (ctrl && key == Win32Api.VkS)
@@ -633,6 +686,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void CharInput(char ch)
     {
+        MarkInputToFrame();
         if (!textEditing)
         {
             return;
@@ -645,6 +699,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void ImeComposition(IntPtr wParam, IntPtr lParam)
     {
+        MarkInputToFrame();
         IntPtr context = Win32Api.ImmGetContext(hwnd);
         if (context == IntPtr.Zero)
         {
@@ -666,6 +721,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                     ResetTextCaretBlink();
                 }
                 compositionText = string.Empty;
+                UpdateInlineTextLayout();
             }
             else if (((long)lParam & Win32Api.GcsCompStr) != 0)
             {
@@ -676,6 +732,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 compositionText = GetCompositionString(context, Win32Api.GcsCompStr);
                 inlineComposing = !string.IsNullOrEmpty(compositionText);
                 ResetTextCaretBlink();
+                UpdateInlineTextLayout();
             }
             PositionImeWindow(context);
             RequestPaint();
@@ -800,6 +857,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         textCaretVisible = true;
         currentTool = ToolMode.Text;
         StartTextCaretTimer();
+        UpdateInlineTextLayout();
+        InvalidateHoverCache();
         PositionImeWindow();
     }
 
@@ -832,7 +891,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         textCaretVisible = true;
         cursorId = Win32Api.IdcIBeam;
         StartTextCaretTimer();
+        UpdateInlineTextLayout();
         SetInlineTextCaretFromPoint(imagePoint, false);
+        InvalidateHoverCache();
         PositionImeWindow();
     }
 
@@ -848,6 +909,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         editingTextIndex = -1;
         editingTextStartState = null;
         StopTextCaretTimer();
+        DisposeInlineTextLayout();
+        InvalidateHoverCache();
         RequestPaint();
     }
 
@@ -867,6 +930,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         inlineCaretIndex = start + text.Length;
         inlineSelectionAnchor = inlineCaretIndex;
         ResetTextCaretBlink();
+        UpdateInlineTextLayout();
         PositionImeWindow();
         RequestPaint();
     }
@@ -886,6 +950,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         compositionText = string.Empty;
         inlineComposing = false;
         ResetTextCaretBlink();
+        UpdateInlineTextLayout();
     }
 
     private void BackspaceInlineText()
@@ -910,6 +975,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         compositionText = string.Empty;
         inlineComposing = false;
         ResetTextCaretBlink();
+        UpdateInlineTextLayout();
         PositionImeWindow();
         RequestPaint();
     }
@@ -935,6 +1001,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         compositionText = string.Empty;
         inlineComposing = false;
         ResetTextCaretBlink();
+        UpdateInlineTextLayout();
         PositionImeWindow();
         RequestPaint();
     }
@@ -949,6 +1016,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         compositionText = string.Empty;
         inlineComposing = false;
         ResetTextCaretBlink();
+        UpdateInlineTextLayout();
         PositionImeWindow();
         RequestPaint();
     }
@@ -1024,8 +1092,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         compositionText = string.Empty;
         inlineComposing = false;
         float em = GetInlineTextEm();
+        UpdateInlineTextLayout();
         GpuPoint relative = new GpuPoint(imagePoint.X - textOrigin.X, imagePoint.Y - textOrigin.Y);
-        TextHitResult hit = GpuRenderer.HitTestText(inlineText, em, relative);
+        TextHitResult hit = inlineTextLayout == null ? GpuRenderer.HitTestText(inlineText, em, relative) : inlineTextLayout.HitTestPoint(relative);
         int index = hit.TextPosition + (hit.IsTrailing ? 1 : 0);
         inlineCaretIndex = ClampInlineIndex(index);
         if (!extendSelection)
@@ -1049,7 +1118,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     {
         float em = GetInlineTextEm();
         string visible = GetInlineVisibleText();
-        GpuRect measured = GpuRenderer.MeasureTextBounds(visible.Length == 0 ? " " : visible, em);
+        UpdateInlineTextLayout();
+        GpuRect measured = inlineTextLayout == null ? GpuRenderer.MeasureTextBounds(visible.Length == 0 ? " " : visible, em) : inlineTextLayout.Bounds;
         float width = Math.Max(80f, measured.Width + em);
         float height = Math.Max(em * 1.5f, measured.Height + em * 0.45f);
         return Inflate(new GpuRect(textOrigin.X, textOrigin.Y, width, height), em * 0.35f, em * 0.25f);
@@ -1142,6 +1212,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void ExecuteCommand(ToolbarCommand command)
     {
+        MarkInputToFrame();
         settingsOverlay.Tooltip = null;
         bool toolChanged = false;
         switch (command)
@@ -1206,6 +1277,10 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         {
             HideToolOptions();
         }
+        if (toolChanged)
+        {
+            InvalidateHoverCache();
+        }
         RequestPaint();
     }
 
@@ -1225,7 +1300,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     {
         if (settingsOverlay.Visible)
         {
-            settingsOverlay.Tooltip = null;
+            ClearTooltip();
             return;
         }
         ToolbarCommand? command = y < AppStyles.ToolbarHeight ? HitToolbar(x, y) : null;
@@ -1237,9 +1312,16 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 ShowToolOptionsTemporarily();
                 return;
             }
-            settingsOverlay.Tooltip = TooltipForCommand(command.Value);
-            settingsOverlay.TooltipPoint = new GpuPoint(x, y);
-            RequestPaint();
+            string tooltip = TooltipForCommand(command.Value);
+            GpuPoint point = new GpuPoint(x, y);
+            if (!string.Equals(settingsOverlay.Tooltip, tooltip, StringComparison.Ordinal) ||
+                settingsOverlay.TooltipPoint.X != point.X ||
+                settingsOverlay.TooltipPoint.Y != point.Y)
+            {
+                settingsOverlay.Tooltip = tooltip;
+                settingsOverlay.TooltipPoint = point;
+                RequestPaint();
+            }
             return;
         }
         ClearTooltip();
@@ -1368,6 +1450,10 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         if (updateStrokeWidth)
         {
             item.StrokeWidth = newStrokeWidth;
+        }
+        if (item.Tool == ToolMode.Text)
+        {
+            item.DisposeTextLayout();
         }
         AnnotationSnapshot after = CaptureAnnotation(item);
         RecordTransformUndo(item, selectedIndex, before, after);
@@ -1518,6 +1604,12 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             return;
         }
 
+        if (timerId == FirstFrameFadeTimerId)
+        {
+            AnimateFirstFrameFade();
+            return;
+        }
+
         if (timerId != ToolOptionsTimerId)
         {
             return;
@@ -1569,6 +1661,54 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             Win32Api.KillTimer(hwnd, TextCaretTimerId);
         }
         textCaretVisible = true;
+    }
+
+    private void AnimateFirstFrameFade()
+    {
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (firstFrameOpacity >= 255)
+        {
+            Win32Api.KillTimer(hwnd, FirstFrameFadeTimerId);
+            DetachLayeredStyle();
+            return;
+        }
+
+        firstFrameOpacity = (byte)Math.Min(255, firstFrameOpacity + 72);
+        ApplyFirstFrameOpacity();
+        if (firstFrameOpacity >= 255)
+        {
+            Win32Api.KillTimer(hwnd, FirstFrameFadeTimerId);
+            DetachLayeredStyle();
+        }
+    }
+
+    private void ApplyFirstFrameOpacity()
+    {
+        if (hwnd != IntPtr.Zero)
+        {
+            Win32Api.SetLayeredWindowAttributes(hwnd, 0, firstFrameOpacity, Win32Api.LwaAlpha);
+        }
+    }
+
+    private void DetachLayeredStyle()
+    {
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        long style = Win32Api.GetWindowLongPtr(hwnd, Win32Api.GwlExStyle).ToInt64();
+        if ((style & Win32Api.WsExLayered) == 0)
+        {
+            return;
+        }
+
+        Win32Api.SetWindowLongPtr(hwnd, Win32Api.GwlExStyle, new IntPtr(style & ~((long)Win32Api.WsExLayered)));
+        Win32Api.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, Win32Api.SwpNoMove | Win32Api.SwpNoSize | Win32Api.SwpNoZOrder | Win32Api.SwpNoActivate | Win32Api.SwpFrameChanged);
     }
 
     private void AnimateToolOptions()
@@ -1742,6 +1882,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             AnnotationItem item = items[committedIndex];
             if (string.IsNullOrEmpty(inlineText))
             {
+                item.DisposeTextLayout();
                 items.RemoveAt(committedIndex);
                 undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Delete, item, committedIndex));
                 ClearSelection();
@@ -1780,6 +1921,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         editingTextIndex = -1;
         editingTextStartState = null;
         StopTextCaretTimer();
+        DisposeInlineTextLayout();
+        InvalidateHoverCache();
     }
 
     private void PositionImeWindow()
@@ -1824,7 +1967,40 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         {
             return 0f;
         }
-        return GpuRenderer.MeasureTextBounds(inlineText.Substring(0, caret), GetInlineTextEm()).Width;
+        UpdateInlineTextLayout();
+        if (inlineTextLayout == null)
+        {
+            return GpuRenderer.MeasureTextBounds(inlineText.Substring(0, caret), GetInlineTextEm()).Width;
+        }
+        return inlineTextLayout.HitTestTextPosition(caret, false).X;
+    }
+
+    private void UpdateInlineTextLayout()
+    {
+        if (!textEditing)
+        {
+            DisposeInlineTextLayout();
+            return;
+        }
+        string visible = GetInlineVisibleText();
+        float em = GetInlineTextEm();
+        if (inlineTextLayout != null &&
+            string.Equals(inlineTextLayout.Text, visible, StringComparison.Ordinal) &&
+            Math.Abs(inlineTextLayout.Em - em) < 0.001f)
+        {
+            return;
+        }
+        DisposeInlineTextLayout();
+        inlineTextLayout = new TextLayoutCache(visible, em, Math.Max(80f, image.Width), Math.Max(em * 1.5f, image.Height));
+    }
+
+    private void DisposeInlineTextLayout()
+    {
+        if (inlineTextLayout != null)
+        {
+            inlineTextLayout.Dispose();
+            inlineTextLayout = null;
+        }
     }
 
     private void AddAnnotation(AnnotationItem item)
@@ -1838,6 +2014,15 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         items.Add(item);
         undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Add, item, index));
         SelectAnnotation(index);
+        InvalidateHoverCache();
+    }
+
+    private static void DisposeAnnotationResources(AnnotationItem item)
+    {
+        if (item != null)
+        {
+            item.DisposeTextLayout();
+        }
     }
 
     private bool DeleteSelectedAnnotation()
@@ -1850,14 +2035,20 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         int index = selectedIndex;
         AnnotationItem item = items[index];
         items.RemoveAt(index);
+        DisposeAnnotationResources(item);
         undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Delete, item, index));
         ClearSelection();
+        InvalidateHoverCache();
         RequestPaint();
         return true;
     }
 
     private void ClearAnnotations()
     {
+        for (int i = 0; i < items.Count; i++)
+        {
+            DisposeAnnotationResources(items[i]);
+        }
         items.Clear();
         undoStack.Clear();
         ClearSelection();
@@ -1871,6 +2062,8 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         editingTextIndex = -1;
         editingTextStartState = null;
         StopTextCaretTimer();
+        DisposeInlineTextLayout();
+        InvalidateHoverCache();
         HideToolOptions();
     }
 
@@ -1880,11 +2073,14 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         {
             if (items.Count > 0)
             {
+                AnnotationItem removed = items[items.Count - 1];
                 items.RemoveAt(items.Count - 1);
+                DisposeAnnotationResources(removed);
                 if (selectedIndex >= items.Count)
                 {
                     ClearSelection();
                 }
+                InvalidateHoverCache();
                 RequestPaint();
             }
             return;
@@ -1896,6 +2092,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             int index = items.IndexOf(action.Item);
             if (index >= 0)
             {
+                DisposeAnnotationResources(action.Item);
                 items.RemoveAt(index);
                 if (selectedIndex == index)
                 {
@@ -1910,6 +2107,10 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         else if (action.Kind == AnnotationUndoKind.Delete && action.Item != null)
         {
             int index = Math.Max(0, Math.Min(action.Index, items.Count));
+            if (action.Item.Tool == ToolMode.Text)
+            {
+                action.Item.DisposeTextLayout();
+            }
             items.Insert(index, action.Item);
             SelectAnnotation(index);
         }
@@ -1923,6 +2124,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             }
         }
 
+        InvalidateHoverCache();
         RequestPaint();
     }
 
@@ -1937,12 +2139,14 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         selectedIndex = index;
         SyncStyleFromSelectedAnnotation();
         ResetSelectionEditState();
+        InvalidateHoverCache();
     }
 
     private void ClearSelection()
     {
         selectedIndex = -1;
         ResetSelectionEditState();
+        InvalidateHoverCache();
     }
 
     private bool HasSelectedItem()
@@ -2225,9 +2429,14 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private GpuPoint ToImagePoint(int x, int y)
     {
         GpuRect view = GetView();
+        return ToImagePoint(new GpuPoint(x, y), view);
+    }
+
+    private GpuPoint ToImagePoint(GpuPoint clientPoint, GpuRect view)
+    {
         float scale = view.Width / Math.Max(1f, image.Width);
-        float imageX = (x - view.X) / Math.Max(0.001f, scale);
-        float imageY = (y - view.Y) / Math.Max(0.001f, scale);
+        float imageX = (clientPoint.X - view.X) / Math.Max(0.001f, scale);
+        float imageY = (clientPoint.Y - view.Y) / Math.Max(0.001f, scale);
         imageX = Math.Max(0f, Math.Min(image.Width, imageX));
         imageY = Math.Max(0f, Math.Min(image.Height, imageY));
         return new GpuPoint(imageX, imageY);
@@ -2237,6 +2446,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     {
         zoom = 1f;
         viewOffset = GpuPoint.Empty;
+        InvalidateHoverCache();
     }
 
     private GpuExtent GetInitialWindowExtent()
@@ -2254,36 +2464,42 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         }
     }
 
-    private void PrimeFirstFrame()
+    private void MarkInputToFrame()
     {
-        if (hwnd == IntPtr.Zero || renderer == null)
+        inputToFrameTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    private void WarmUpRenderer()
+    {
+        if (hwnd == IntPtr.Zero)
         {
             return;
         }
 
-        IntPtr hdc = Win32Api.GetDC(hwnd);
-        if (hdc == IntPtr.Zero)
+        if (renderer == null)
+        {
+            renderer = GpuRenderer.CreateForWindow(image);
+        }
+    }
+
+    private void StartFirstFrameFadeIn()
+    {
+        if (firstFrameFadeStarted || hwnd == IntPtr.Zero)
         {
             return;
         }
+        firstFrameFadeStarted = true;
+        firstFrameOpacity = 48;
+        ApplyFirstFrameOpacity();
+        Win32Api.KillTimer(hwnd, FirstFrameFadeTimerId);
+        Win32Api.SetTimer(hwnd, FirstFrameFadeTimerId, 16, IntPtr.Zero);
+    }
 
-        try
+    private void StopFirstFrameFade()
+    {
+        if (hwnd != IntPtr.Zero)
         {
-            Win32Api.NativeRect rect;
-            Win32Api.GetClientRect(hwnd, out rect);
-            int width = Math.Max(1, rect.right - rect.left);
-            int height = Math.Max(1, rect.bottom - rect.top);
-            settingsOverlay.TopMost = topMost;
-            renderer.RenderToHdc(hdc, width, height, GetView(width, height), items, GetPreviewItem(), selectedIndex, true, currentTool, stroke, strokeWidth, settingsOverlay);
-            consecutiveRenderFailures = 0;
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error("GPU first frame prepaint failed; waiting for WM_PAINT.", ex);
-        }
-        finally
-        {
-            Win32Api.ReleaseDC(hwnd, hdc);
+            Win32Api.KillTimer(hwnd, FirstFrameFadeTimerId);
         }
     }
 
@@ -2313,7 +2529,25 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         if (!transient && consecutiveRenderFailures >= MaxConsecutiveRenderFailures)
         {
             ShowFatalErrorAndClose("GPU renderer failed repeatedly.", ex);
+            return;
         }
+
+        RequestPaint();
+    }
+
+    private void InvalidateHoverCache()
+    {
+        hoverStateVersion++;
+        cachedHoverVersion = -1;
+    }
+
+    private int CacheHoverCursor(int x, int y, int cursor)
+    {
+        cachedHoverVersion = hoverStateVersion;
+        cachedHoverX = x;
+        cachedHoverY = y;
+        cachedHoverCursorId = cursor;
+        return cursor;
     }
 
     private bool TryRecreateRenderer(out Exception error)
@@ -2499,6 +2733,10 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         item.StrokeWidth = snapshot.StrokeWidth;
         item.Text = snapshot.Text;
         item.SetPoints(snapshot.Points);
+        if (item.Tool == ToolMode.Text)
+        {
+            item.DisposeTextLayout();
+        }
     }
 
     private bool RecordTransformUndo(AnnotationItem item, int index, AnnotationSnapshot before, AnnotationSnapshot after)
@@ -2809,487 +3047,16 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         StopToolOptionsTimer();
         StopToolOptionsAnimation();
         StopTextCaretTimer();
+        StopFirstFrameFade();
+        for (int i = 0; i < items.Count; i++)
+        {
+            DisposeAnnotationResources(items[i]);
+        }
         if (renderer != null)
         {
             renderer.Dispose();
             renderer = null;
         }
-    }
-}
-
-internal static class ClipboardBridge
-{
-    private static readonly uint PngFormat = Win32Api.RegisterClipboardFormat("PNG");
-
-    public static void SetImage(IntPtr owner, string path, int width, int height, byte[] pixels)
-    {
-        if (string.IsNullOrEmpty(path))
-        {
-            return;
-        }
-
-        IntPtr dropMemory = IntPtr.Zero;
-        IntPtr dibMemory = IntPtr.Zero;
-        IntPtr pngMemory = IntPtr.Zero;
-        try
-        {
-            byte[] pngBytes = PngFormat == 0 ? null : File.ReadAllBytes(path);
-            dropMemory = CreateFileDropMemory(path);
-            dibMemory = CreateDibMemory(width, height, pixels);
-            pngMemory = pngBytes == null ? IntPtr.Zero : CreateBytesMemory(pngBytes);
-            if (!Win32Api.OpenClipboard(owner))
-            {
-                return;
-            }
-
-            try
-            {
-                Win32Api.EmptyClipboard();
-                if (dropMemory != IntPtr.Zero && Win32Api.SetClipboardData(Win32Api.CfHdrop, dropMemory) != IntPtr.Zero)
-                {
-                    dropMemory = IntPtr.Zero;
-                }
-                if (dibMemory != IntPtr.Zero && Win32Api.SetClipboardData(Win32Api.CfDib, dibMemory) != IntPtr.Zero)
-                {
-                    dibMemory = IntPtr.Zero;
-                }
-                if (PngFormat != 0 && pngMemory != IntPtr.Zero && Win32Api.SetClipboardData(PngFormat, pngMemory) != IntPtr.Zero)
-                {
-                    pngMemory = IntPtr.Zero;
-                }
-            }
-            finally
-            {
-                Win32Api.CloseClipboard();
-            }
-        }
-        finally
-        {
-            FreeGlobal(dropMemory);
-            FreeGlobal(dibMemory);
-            FreeGlobal(pngMemory);
-        }
-    }
-
-    public static bool SetUnicodeText(IntPtr owner, string text)
-    {
-        text = text ?? string.Empty;
-        byte[] bytes = System.Text.Encoding.Unicode.GetBytes(text + "\0");
-        IntPtr memory = CreateBytesMemory(bytes);
-        if (memory == IntPtr.Zero)
-        {
-            return false;
-        }
-
-        if (!Win32Api.OpenClipboard(owner))
-        {
-            FreeGlobal(memory);
-            return false;
-        }
-
-        try
-        {
-            Win32Api.EmptyClipboard();
-            if (Win32Api.SetClipboardData(Win32Api.CfUnicodeText, memory) == IntPtr.Zero)
-            {
-                return false;
-            }
-            memory = IntPtr.Zero;
-            return true;
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-            FreeGlobal(memory);
-        }
-    }
-
-    public static string GetUnicodeText(IntPtr owner)
-    {
-        if (!Win32Api.IsClipboardFormatAvailable(Win32Api.CfUnicodeText) || !Win32Api.OpenClipboard(owner))
-        {
-            return string.Empty;
-        }
-
-        IntPtr memory = IntPtr.Zero;
-        IntPtr locked = IntPtr.Zero;
-        try
-        {
-            memory = Win32Api.GetClipboardData(Win32Api.CfUnicodeText);
-            if (memory == IntPtr.Zero)
-            {
-                return string.Empty;
-            }
-            locked = Win32Api.GlobalLock(memory);
-            if (locked == IntPtr.Zero)
-            {
-                return string.Empty;
-            }
-            return Marshal.PtrToStringUni(locked) ?? string.Empty;
-        }
-        finally
-        {
-            if (locked != IntPtr.Zero)
-            {
-                Win32Api.GlobalUnlock(memory);
-            }
-            Win32Api.CloseClipboard();
-        }
-    }
-
-    public static string TryGetClipboardImagePath()
-    {
-        string file = TryGetFileDrop();
-        if (!string.IsNullOrEmpty(file))
-        {
-            return file;
-        }
-
-        string png = TrySavePngFormat();
-        if (!string.IsNullOrEmpty(png))
-        {
-            return png;
-        }
-
-        return TrySaveDibFormat();
-    }
-
-    public static void SetPngBytesForSelfTest(byte[] bytes)
-    {
-        IntPtr memory = CreateBytesMemory(bytes);
-        if (memory == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("Cannot allocate PNG clipboard memory.");
-        }
-        if (!Win32Api.OpenClipboard(IntPtr.Zero))
-        {
-            FreeGlobal(memory);
-            throw new InvalidOperationException("Cannot open clipboard for PNG self test.");
-        }
-        try
-        {
-            Win32Api.EmptyClipboard();
-            if (Win32Api.SetClipboardData(PngFormat, memory) == IntPtr.Zero)
-            {
-                throw new InvalidOperationException("Cannot set PNG clipboard data.");
-            }
-            memory = IntPtr.Zero;
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-            FreeGlobal(memory);
-        }
-    }
-
-    public static void SetDibForSelfTest(int width, int height, byte[] pixels)
-    {
-        IntPtr memory = CreateDibMemory(width, height, pixels);
-        if (memory == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("Cannot allocate DIB clipboard memory.");
-        }
-        if (!Win32Api.OpenClipboard(IntPtr.Zero))
-        {
-            FreeGlobal(memory);
-            throw new InvalidOperationException("Cannot open clipboard for DIB self test.");
-        }
-        try
-        {
-            Win32Api.EmptyClipboard();
-            if (Win32Api.SetClipboardData(Win32Api.CfDib, memory) == IntPtr.Zero)
-            {
-                throw new InvalidOperationException("Cannot set DIB clipboard data.");
-            }
-            memory = IntPtr.Zero;
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-            FreeGlobal(memory);
-        }
-    }
-
-    private static string TryGetFileDrop()
-    {
-        if (!Win32Api.IsClipboardFormatAvailable(Win32Api.CfHdrop))
-        {
-            return null;
-        }
-        if (!Win32Api.OpenClipboard(IntPtr.Zero))
-        {
-            return null;
-        }
-        try
-        {
-            IntPtr drop = Win32Api.GetClipboardData(Win32Api.CfHdrop);
-            if (drop == IntPtr.Zero)
-            {
-                return null;
-            }
-            uint count = Win32Api.DragQueryFile(drop, 0xFFFFFFFF, IntPtr.Zero, 0);
-            for (uint i = 0; i < count; i++)
-            {
-                uint length = Win32Api.DragQueryFile(drop, i, IntPtr.Zero, 0);
-                IntPtr buffer = Marshal.AllocHGlobal((int)((length + 1) * 2));
-                try
-                {
-                    Win32Api.DragQueryFile(drop, i, buffer, length + 1);
-                    string path = Marshal.PtrToStringUni(buffer);
-                    if (IsSupportedImagePath(path))
-                    {
-                        return path;
-                    }
-                }
-                finally
-                {
-                    Marshal.FreeHGlobal(buffer);
-                }
-            }
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-        }
-        return null;
-    }
-
-    private static string TrySavePngFormat()
-    {
-        if (PngFormat == 0 || !Win32Api.IsClipboardFormatAvailable(PngFormat))
-        {
-            return null;
-        }
-        if (!Win32Api.OpenClipboard(IntPtr.Zero))
-        {
-            return null;
-        }
-        try
-        {
-            IntPtr handle = Win32Api.GetClipboardData(PngFormat);
-            byte[] bytes = CopyGlobalBytes(handle);
-            if (bytes == null || bytes.Length == 0)
-            {
-                return null;
-            }
-            string path = Path.Combine(Path.GetTempPath(), "quicker-annotate-clipboard.png");
-            File.WriteAllBytes(path, bytes);
-            return path;
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-        }
-    }
-
-    private static string TrySaveDibFormat()
-    {
-        uint format = Win32Api.IsClipboardFormatAvailable(Win32Api.CfDibV5) ? Win32Api.CfDibV5 :
-            (Win32Api.IsClipboardFormatAvailable(Win32Api.CfDib) ? Win32Api.CfDib : 0);
-        if (format == 0 || !Win32Api.OpenClipboard(IntPtr.Zero))
-        {
-            return null;
-        }
-        try
-        {
-            IntPtr handle = Win32Api.GetClipboardData(format);
-            byte[] dib = CopyGlobalBytes(handle);
-            if (dib == null || dib.Length < 40)
-            {
-                return null;
-            }
-            int headerBytes = BitConverter.ToInt32(dib, 0);
-            int width = BitConverter.ToInt32(dib, 4);
-            int signedHeight = BitConverter.ToInt32(dib, 8);
-            short planes = BitConverter.ToInt16(dib, 12);
-            short bits = BitConverter.ToInt16(dib, 14);
-            int compression = BitConverter.ToInt32(dib, 16);
-            if (width <= 0 || signedHeight == 0 || planes != 1 || (bits != 32 && bits != 24) || headerBytes <= 0 || headerBytes >= dib.Length)
-            {
-                return null;
-            }
-            int height = Math.Abs(signedHeight);
-            int stride = ((width * bits + 31) / 32) * 4;
-            int pixelOffset = headerBytes;
-            if (compression == 3 && format == Win32Api.CfDib && bits == 32)
-            {
-                pixelOffset += 12;
-            }
-            if (pixelOffset + stride * height > dib.Length)
-            {
-                return null;
-            }
-
-            byte[] pixels = new byte[width * height * 4];
-            bool bottomUp = signedHeight > 0;
-            for (int y = 0; y < height; y++)
-            {
-                int srcY = bottomUp ? height - 1 - y : y;
-                int src = pixelOffset + srcY * stride;
-                int dst = y * width * 4;
-                for (int x = 0; x < width; x++)
-                {
-                    pixels[dst + 0] = dib[src + 0];
-                    pixels[dst + 1] = dib[src + 1];
-                    pixels[dst + 2] = dib[src + 2];
-                    pixels[dst + 3] = bits == 32 ? (dib[src + 3] == 0 ? (byte)255 : dib[src + 3]) : (byte)255;
-                    src += bits / 8;
-                    dst += 4;
-                }
-            }
-
-            string path = Path.Combine(Path.GetTempPath(), "quicker-annotate-clipboard.png");
-            WicCodec.SavePixels(path, width, height, pixels);
-            return path;
-        }
-        finally
-        {
-            Win32Api.CloseClipboard();
-        }
-    }
-
-    private static IntPtr CreateFileDropMemory(string path)
-    {
-        string fullPath = Path.GetFullPath(path);
-        byte[] chars = System.Text.Encoding.Unicode.GetBytes(fullPath + "\0\0");
-        int header = Marshal.SizeOf(typeof(Win32Api.DropFiles));
-        IntPtr memory = Win32Api.GlobalAlloc(Win32Api.GmemMoveable | Win32Api.GmemZeroinit, new UIntPtr((uint)(header + chars.Length)));
-        if (memory == IntPtr.Zero)
-        {
-            return IntPtr.Zero;
-        }
-        IntPtr ptr = Win32Api.GlobalLock(memory);
-        if (ptr == IntPtr.Zero)
-        {
-            FreeGlobal(memory);
-            return IntPtr.Zero;
-        }
-        try
-        {
-            Win32Api.DropFiles drop = new Win32Api.DropFiles();
-            drop.pFiles = (uint)header;
-            drop.fWide = 1;
-            Marshal.StructureToPtr(drop, ptr, false);
-            Marshal.Copy(chars, 0, new IntPtr(ptr.ToInt64() + header), chars.Length);
-            return memory;
-        }
-        finally
-        {
-            Win32Api.GlobalUnlock(memory);
-        }
-    }
-
-    private static IntPtr CreateDibMemory(int width, int height, byte[] pixels)
-    {
-        if (width <= 0 || height <= 0 || pixels == null || pixels.Length < width * height * 4)
-        {
-            return IntPtr.Zero;
-        }
-        const int header = 40;
-        int bytes = header + pixels.Length;
-        IntPtr memory = Win32Api.GlobalAlloc(Win32Api.GmemMoveable | Win32Api.GmemZeroinit, new UIntPtr((uint)bytes));
-        if (memory == IntPtr.Zero)
-        {
-            return IntPtr.Zero;
-        }
-        IntPtr ptr = Win32Api.GlobalLock(memory);
-        if (ptr == IntPtr.Zero)
-        {
-            FreeGlobal(memory);
-            return IntPtr.Zero;
-        }
-        try
-        {
-            Marshal.WriteInt32(ptr, 0, header);
-            Marshal.WriteInt32(ptr, 4, width);
-            Marshal.WriteInt32(ptr, 8, -height);
-            Marshal.WriteInt16(ptr, 12, 1);
-            Marshal.WriteInt16(ptr, 14, 32);
-            Marshal.WriteInt32(ptr, 16, 0);
-            Marshal.WriteInt32(ptr, 20, pixels.Length);
-            Marshal.Copy(pixels, 0, new IntPtr(ptr.ToInt64() + header), pixels.Length);
-            return memory;
-        }
-        finally
-        {
-            Win32Api.GlobalUnlock(memory);
-        }
-    }
-
-    private static IntPtr CreateBytesMemory(byte[] bytes)
-    {
-        if (bytes == null || bytes.Length == 0)
-        {
-            return IntPtr.Zero;
-        }
-        IntPtr memory = Win32Api.GlobalAlloc(Win32Api.GmemMoveable | Win32Api.GmemZeroinit, new UIntPtr((uint)bytes.Length));
-        if (memory == IntPtr.Zero)
-        {
-            return IntPtr.Zero;
-        }
-        IntPtr ptr = Win32Api.GlobalLock(memory);
-        if (ptr == IntPtr.Zero)
-        {
-            FreeGlobal(memory);
-            return IntPtr.Zero;
-        }
-        try
-        {
-            Marshal.Copy(bytes, 0, ptr, bytes.Length);
-            return memory;
-        }
-        finally
-        {
-            Win32Api.GlobalUnlock(memory);
-        }
-    }
-
-    private static byte[] CopyGlobalBytes(IntPtr handle)
-    {
-        if (handle == IntPtr.Zero)
-        {
-            return null;
-        }
-        UIntPtr sizePtr = Win32Api.GlobalSize(handle);
-        long size = (long)sizePtr.ToUInt64();
-        if (size <= 0 || size > int.MaxValue)
-        {
-            return null;
-        }
-        IntPtr ptr = Win32Api.GlobalLock(handle);
-        if (ptr == IntPtr.Zero)
-        {
-            return null;
-        }
-        try
-        {
-            byte[] bytes = new byte[(int)size];
-            Marshal.Copy(ptr, bytes, 0, bytes.Length);
-            return bytes;
-        }
-        finally
-        {
-            Win32Api.GlobalUnlock(handle);
-        }
-    }
-
-    private static void FreeGlobal(IntPtr memory)
-    {
-        if (memory != IntPtr.Zero)
-        {
-            Win32Api.GlobalFree(memory);
-        }
-    }
-
-    private static bool IsSupportedImagePath(string path)
-    {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path))
-        {
-            return false;
-        }
-        string ext = Path.GetExtension(path).ToLowerInvariant();
-        return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" ||
-            ext == ".gif" || ext == ".tif" || ext == ".tiff";
     }
 }
 

@@ -31,11 +31,12 @@ internal static class Program
                 return 0;
             }
 
+            long startupTimestamp = Stopwatch.GetTimestamp();
             string outputDirectory = GetConfiguredOutputDirectory(args);
             string[] inputArgs = GetInputArgs(args);
             string inputPath = GetInputImagePath(inputArgs);
             using (WicImageDocument image = WicImageDocument.Load(inputPath))
-            using (GpuAnnotatorWindow window = new GpuAnnotatorWindow(inputPath, image, outputDirectory))
+            using (GpuAnnotatorWindow window = new GpuAnnotatorWindow(inputPath, image, outputDirectory, startupTimestamp))
             {
                 return window.Run();
             }
@@ -54,6 +55,7 @@ internal static class Program
         finally
         {
             RenderPerformanceProbe.FlushSummary("shutdown");
+            DWriteApi.ReleaseSharedFactory();
             Win32Api.CoUninitialize();
         }
     }
@@ -252,47 +254,19 @@ internal static class Program
         {
             List<AnnotationItem> annotations = CreateBenchmarkAnnotations(benchmarkCase.Width, benchmarkCase.Height);
             double[] samples = new double[frames];
-            GpuAnnotatorWindow.EnsureWindowClass();
-            IntPtr hwnd = Win32Api.CreateWindowEx(
-                0,
-                GpuAnnotatorWindow.RegisteredClassName,
-                "benchmark",
-                Win32Api.WsOverlappedWindow,
-                0,
-                0,
-                benchmarkCase.CanvasWidth,
-                benchmarkCase.CanvasHeight,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                Win32Api.GetModuleHandle(null),
-                IntPtr.Zero);
-            if (hwnd == IntPtr.Zero)
+            using (SelfTestRenderSurface surface = SelfTestRenderSurface.Create(benchmarkCase.CanvasWidth, benchmarkCase.CanvasHeight))
             {
-                throw new InvalidOperationException("Benchmark window creation failed.");
-            }
-            IntPtr hdc = IntPtr.Zero;
-            try
-            {
-                hdc = Win32Api.GetDC(hwnd);
                 using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
                 {
                     GpuRect view = GetBenchmarkView(benchmarkCase);
                     for (int i = 0; i < frames; i++)
                     {
                         Stopwatch sw = Stopwatch.StartNew();
-                        renderer.RenderToHdc(hdc, benchmarkCase.CanvasWidth, benchmarkCase.CanvasHeight, view, annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+                        renderer.RenderToHdc(surface.Hdc, benchmarkCase.CanvasWidth, benchmarkCase.CanvasHeight, view, annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
                         sw.Stop();
                         samples[i] = sw.Elapsed.TotalMilliseconds;
                     }
                 }
-            }
-            finally
-            {
-                if (hdc != IntPtr.Zero)
-                {
-                    Win32Api.ReleaseDC(hwnd, hdc);
-                }
-                Win32Api.DestroyWindow(hwnd);
             }
             Array.Sort(samples);
             double sum = 0;
@@ -351,6 +325,7 @@ internal static class Program
         AssertGpuWindowChromeRender();
         AssertGpuInteractionSemantics();
         AssertClipboardWorkflow();
+        AssertClipboardStartupSmoke();
         AssertBenchmarkSmoke();
     }
 
@@ -445,45 +420,16 @@ internal static class Program
     {
         using (WicImageDocument image = WicImageDocument.CreateSynthetic(96, 64))
         {
-            GpuAnnotatorWindow.EnsureWindowClass();
-            IntPtr hwnd = Win32Api.CreateWindowEx(
-                0,
-                GpuAnnotatorWindow.RegisteredClassName,
-                "selftest-rebuild",
-                Win32Api.WsOverlappedWindow,
-                0,
-                0,
-                96,
-                64,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                Win32Api.GetModuleHandle(null),
-                IntPtr.Zero);
-            if (hwnd == IntPtr.Zero)
+            List<AnnotationItem> annotations = CreateBenchmarkAnnotations(96, 64);
+            using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
+            using (SelfTestRenderSurface surface = SelfTestRenderSurface.Create(96, 64))
             {
-                throw new InvalidOperationException("Renderer rebuild self test cannot create window.");
+                renderer.RenderToHdc(surface.Hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
             }
-            IntPtr hdc = IntPtr.Zero;
-            try
+            using (GpuRenderer rebuilt = GpuRenderer.CreateForWindow(image))
+            using (SelfTestRenderSurface surface = SelfTestRenderSurface.Create(96, 64))
             {
-                hdc = Win32Api.GetDC(hwnd);
-                List<AnnotationItem> annotations = CreateBenchmarkAnnotations(96, 64);
-                using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
-                {
-                    renderer.RenderToHdc(hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
-                }
-                using (GpuRenderer rebuilt = GpuRenderer.CreateForWindow(image))
-                {
-                    rebuilt.RenderToHdc(hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
-                }
-            }
-            finally
-            {
-                if (hdc != IntPtr.Zero)
-                {
-                    Win32Api.ReleaseDC(hwnd, hdc);
-                }
-                Win32Api.DestroyWindow(hwnd);
+                rebuilt.RenderToHdc(surface.Hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
             }
         }
     }
@@ -492,29 +438,8 @@ internal static class Program
     {
         using (WicImageDocument image = WicImageDocument.CreateSynthetic(320, 180))
         {
-            GpuAnnotatorWindow.EnsureWindowClass();
-            IntPtr hwnd = Win32Api.CreateWindowEx(
-                0,
-                GpuAnnotatorWindow.RegisteredClassName,
-                "selftest-chrome",
-                Win32Api.WsOverlappedWindow,
-                0,
-                0,
-                640,
-                420,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                Win32Api.GetModuleHandle(null),
-                IntPtr.Zero);
-            if (hwnd == IntPtr.Zero)
+            using (SelfTestRenderSurface surface = SelfTestRenderSurface.Create(640, 420))
             {
-                throw new InvalidOperationException("Window chrome render self test cannot create window.");
-            }
-
-            IntPtr hdc = IntPtr.Zero;
-            try
-            {
-                hdc = Win32Api.GetDC(hwnd);
                 List<AnnotationItem> annotations = CreateBenchmarkAnnotations(320, 180);
                 AnnotationItem preview = new AnnotationItem
                 {
@@ -530,19 +455,11 @@ internal static class Program
                 using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
                 {
                     GpuRect view = new GpuRect(42, 126, 512, 288);
-                    renderer.RenderToHdc(hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
+                    renderer.RenderToHdc(surface.Hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
                     overlay.Visible = true;
                     overlay.OutputDirectory = Path.GetTempPath();
-                    renderer.RenderToHdc(hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
+                    renderer.RenderToHdc(surface.Hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
                 }
-            }
-            finally
-            {
-                if (hdc != IntPtr.Zero)
-                {
-                    Win32Api.ReleaseDC(hwnd, hdc);
-                }
-                Win32Api.DestroyWindow(hwnd);
             }
         }
     }
@@ -568,7 +485,7 @@ internal static class Program
 
         using (WicImageDocument image = WicImageDocument.CreateSynthetic(80, 60))
         {
-            GpuAnnotatorWindow window = new GpuAnnotatorWindow("selftest.png", image, null);
+            GpuAnnotatorWindow window = new GpuAnnotatorWindow("selftest.png", image, null, 0);
             Type type = typeof(GpuAnnotatorWindow);
             System.Reflection.BindingFlags instanceFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
             System.Reflection.BindingFlags staticFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
@@ -777,12 +694,140 @@ internal static class Program
         }
     }
 
+    private static void AssertClipboardStartupSmoke()
+    {
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(96, 64))
+        {
+            string pngPath = Path.Combine(Path.GetTempPath(), "quicker-gpu-startup-" + Guid.NewGuid().ToString("N") + ".png");
+            image.Save(pngPath);
+            byte[] pngBytes = File.ReadAllBytes(pngPath);
+            ClipboardBridge.SetPngBytesForSelfTest(pngBytes);
+
+            Stopwatch sw = Stopwatch.StartNew();
+            string startupPath = GetInputImagePath(new string[0]);
+            using (WicImageDocument loaded = WicImageDocument.Load(startupPath))
+            {
+                sw.Stop();
+                if (loaded.Width != 96 || loaded.Height != 64)
+                {
+                    throw new InvalidOperationException("Clipboard startup smoke loaded an unexpected image.");
+                }
+            }
+
+            double elapsedMs = sw.Elapsed.TotalMilliseconds;
+            AppLog.Info("Clipboard startup smoke: " + elapsedMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " ms");
+            if (elapsedMs > 1500d)
+            {
+                throw new InvalidOperationException("Clipboard startup smoke exceeded 1500 ms.");
+            }
+        }
+    }
+
     private static void AssertBenchmarkSmoke()
     {
         BenchmarkResult result = RunBenchmarkCase(new BenchmarkCase("smoke", 96, 64, 96, 64), 1);
         if (result.Max <= 0)
         {
             throw new InvalidOperationException("Benchmark smoke self test failed.");
+        }
+    }
+
+    private sealed class SelfTestRenderSurface : IDisposable
+    {
+        private readonly IntPtr screenDc;
+        private readonly IntPtr memoryDc;
+        private readonly IntPtr surfaceBits;
+        private readonly IntPtr oldObject;
+        private bool disposed;
+
+        private SelfTestRenderSurface(IntPtr screenDc, IntPtr memoryDc, IntPtr surfaceBits, IntPtr oldObject)
+        {
+            this.screenDc = screenDc;
+            this.memoryDc = memoryDc;
+            this.surfaceBits = surfaceBits;
+            this.oldObject = oldObject;
+        }
+
+        public IntPtr Hdc
+        {
+            get { return memoryDc; }
+        }
+
+        public static SelfTestRenderSurface Create(int width, int height)
+        {
+            IntPtr screenDc = IntPtr.Zero;
+            IntPtr memoryDc = IntPtr.Zero;
+            IntPtr surfaceBits = IntPtr.Zero;
+            IntPtr oldObject = IntPtr.Zero;
+            try
+            {
+                screenDc = Win32Api.GetDC(IntPtr.Zero);
+                if (screenDc == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Self-test surface could not acquire screen DC.");
+                }
+                memoryDc = Win32Api.CreateCompatibleDC(screenDc);
+                if (memoryDc == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Self-test surface could not create memory DC.");
+                }
+                surfaceBits = Win32Api.CreateCompatibleSurface(screenDc, width, height);
+                if (surfaceBits == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Self-test surface could not create backing surface.");
+                }
+                oldObject = Win32Api.SelectObject(memoryDc, surfaceBits);
+                if (oldObject == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Self-test surface could not bind backing surface.");
+                }
+                return new SelfTestRenderSurface(screenDc, memoryDc, surfaceBits, oldObject);
+            }
+            catch
+            {
+                if (oldObject != IntPtr.Zero)
+                {
+                    Win32Api.SelectObject(memoryDc, oldObject);
+                }
+                if (surfaceBits != IntPtr.Zero)
+                {
+                    Win32Api.DeleteObject(surfaceBits);
+                }
+                if (memoryDc != IntPtr.Zero)
+                {
+                    Win32Api.DeleteDC(memoryDc);
+                }
+                if (screenDc != IntPtr.Zero)
+                {
+                    Win32Api.ReleaseDC(IntPtr.Zero, screenDc);
+                }
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed)
+            {
+                return;
+            }
+            disposed = true;
+            if (memoryDc != IntPtr.Zero && oldObject != IntPtr.Zero)
+            {
+                Win32Api.SelectObject(memoryDc, oldObject);
+            }
+            if (surfaceBits != IntPtr.Zero)
+            {
+                Win32Api.DeleteObject(surfaceBits);
+            }
+            if (memoryDc != IntPtr.Zero)
+            {
+                Win32Api.DeleteDC(memoryDc);
+            }
+            if (screenDc != IntPtr.Zero)
+            {
+                Win32Api.ReleaseDC(IntPtr.Zero, screenDc);
+            }
         }
     }
 

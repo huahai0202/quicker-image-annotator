@@ -256,13 +256,28 @@ internal struct Rgba
 internal sealed class AnnotationItem
 {
     private GpuPoint[] drawingPointsCache;
+    private TextLayoutCache textLayoutCache;
+    private string text = string.Empty;
 
     public ToolMode Tool;
     public GpuPoint Start;
     public GpuPoint End;
     public Rgba Stroke = AppStyles.DefaultStroke;
     public float StrokeWidth = AppStyles.DefaultStrokeWidth;
-    public string Text = string.Empty;
+    public string Text
+    {
+        get { return text; }
+        set
+        {
+            string normalized = value ?? string.Empty;
+            if (string.Equals(text, normalized, StringComparison.Ordinal))
+            {
+                return;
+            }
+            text = normalized;
+            DisposeTextLayout();
+        }
+    }
     public bool TextEditing;
     public int TextCaretIndex;
     public int TextSelectionAnchor;
@@ -306,6 +321,131 @@ internal sealed class AnnotationItem
             Points[i] = new GpuPoint(p.X + dx, p.Y + dy);
         }
         drawingPointsCache = null;
+    }
+
+    public TextLayoutCache GetTextLayout(float em, float maxWidth, float maxHeight)
+    {
+        if (Tool != ToolMode.Text)
+        {
+            return null;
+        }
+        if (textLayoutCache != null &&
+            string.Equals(textLayoutCache.Text, text, StringComparison.Ordinal) &&
+            Math.Abs(textLayoutCache.Em - Math.Max(1f, em)) < 0.001f &&
+            Math.Abs(textLayoutCache.MaxWidth - Math.Max(1f, maxWidth)) < 0.001f &&
+            Math.Abs(textLayoutCache.MaxHeight - Math.Max(1f, maxHeight)) < 0.001f)
+        {
+            return textLayoutCache;
+        }
+        DisposeTextLayout();
+        textLayoutCache = new TextLayoutCache(Text ?? string.Empty, em, maxWidth, maxHeight);
+        return textLayoutCache;
+    }
+
+    public void DisposeTextLayout()
+    {
+        if (textLayoutCache != null)
+        {
+            textLayoutCache.Dispose();
+            textLayoutCache = null;
+        }
+    }
+}
+
+internal sealed class TextLayoutCache : IDisposable
+{
+    private readonly IntPtr format;
+    private readonly IntPtr layout;
+    private readonly string text;
+    private readonly float em;
+    private readonly float maxWidth;
+    private readonly float maxHeight;
+    private readonly GpuRect bounds;
+    private bool disposed;
+
+    public TextLayoutCache(string text, float em)
+        : this(text, em, 100000f, 10000f)
+    {
+    }
+
+    public TextLayoutCache(string text, float em, float maxWidth, float maxHeight)
+    {
+        this.text = text ?? string.Empty;
+        this.em = Math.Max(1f, em);
+        this.maxWidth = Math.Max(1f, maxWidth);
+        this.maxHeight = Math.Max(1f, maxHeight);
+        IntPtr factory = DWriteApi.GetSharedFactory();
+        format = DWriteApi.CreateTextFormat(factory, AppStyles.UiFontName, this.em);
+        layout = DWriteApi.CreateTextLayout(factory, this.text, format, this.maxWidth, this.maxHeight);
+        DWriteApi.TextMetrics metrics = DWriteApi.GetMetrics(layout);
+        bounds = new GpuRect(metrics.left, metrics.top, Math.Max(1f, metrics.widthIncludingTrailingWhitespace), Math.Max(1f, metrics.height));
+    }
+
+    public string Text
+    {
+        get { return text; }
+    }
+
+    public float Em
+    {
+        get { return em; }
+    }
+
+    public float MaxWidth
+    {
+        get { return maxWidth; }
+    }
+
+    public float MaxHeight
+    {
+        get { return maxHeight; }
+    }
+
+    public GpuRect Bounds
+    {
+        get { return bounds; }
+    }
+
+    public IntPtr Layout
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return layout;
+        }
+    }
+
+    public TextHitResult HitTestPoint(GpuPoint point)
+    {
+        ThrowIfDisposed();
+        return DWriteApi.HitTestPoint(layout, point.X, point.Y);
+    }
+
+    public GpuPoint HitTestTextPosition(int textPosition, bool trailing)
+    {
+        ThrowIfDisposed();
+        return DWriteApi.HitTestTextPosition(layout, textPosition, trailing);
+    }
+
+    public void Dispose()
+    {
+        if (disposed)
+        {
+            return;
+        }
+        disposed = true;
+        IntPtr localLayout = layout;
+        IntPtr localFormat = format;
+        ComUtil.Release(ref localLayout);
+        ComUtil.Release(ref localFormat);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (disposed)
+        {
+            throw new ObjectDisposedException("TextLayoutCache");
+        }
     }
 }
 
