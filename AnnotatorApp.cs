@@ -1,1696 +1,82 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
+using System.Diagnostics;
 using System.IO;
-using System.Windows.Forms;
-
-internal sealed partial class AnnotatorForm : Form
-{
-    private readonly string imagePath;
-    private string outputDirectory;
-    private readonly Bitmap baseImage;
-    private readonly List<AnnotationItem> items = new List<AnnotationItem>();
-    private readonly ModernToolbarPanel toolbar = new ModernToolbarPanel();
-    private readonly BufferedCanvas canvas = new BufferedCanvas();
-    private readonly Dictionary<ToolMode, Button> toolButtons = new Dictionary<ToolMode, Button>();
-    private readonly Stack<AnnotationUndoAction> undoStack = new Stack<AnnotationUndoAction>();
-    private readonly Panel toolOptionsPanel = new Panel();
-    private readonly List<Button> colorButtons = new List<Button>();
-    private readonly List<Button> widthButtons = new List<Button>();
-    private readonly ToolTip toolbarToolTip = new ToolTip();
-    private ModernIconButton topMostButton;
-    private ToolMode currentTool = ToolMode.Rect;
-    private bool drawing;
-    private bool panning;
-    private PointF startPoint;
-    private PointF currentPoint;
-    private Point lastPanPoint;
-    private AnnotationItem currentPenItem;
-    private int selectedItemIndex = -1;
-    private bool movingSelection;
-    private bool resizingSelection;
-    private SelectionHandle activeSelectionHandle = SelectionHandle.None;
-    private PointF lastMovePoint;
-    private PointF moveStartPoint;
-    private PointF moveCurrentPoint;
-    private bool selectionMoved;
-    private AnnotationSnapshot selectionEditStartState;
-    private RectangleF selectionEditStartBounds;
-    private Bitmap displayCache;
-    private Size displayCacheSize = Size.Empty;
-    private Bitmap moveBackgroundCache;
-    private Size moveBackgroundCacheSize = Size.Empty;
-    private Icon windowIcon;
-    private float zoomFactor = 1f;
-    private PointF viewOffset = PointF.Empty;
-    private readonly Timer cacheRefreshTimer = new Timer();
-    private readonly AnimationFrameScheduler canvasRenderScheduler;
-    private readonly ThrottledAction imePositionThrottle;
-    private bool suspendDisplayCache;
-    private bool annotationsChanged = true;
-    private Color strokeColor = AppStyles.DefaultStroke;
-    private float strokeWidth = 4f;
-    private const int MaxCachePixels = 6000000;
-    private const float MinAnnotationExtent = 2f;
-    private const float SelectionHitTolerancePixels = 8f;
-    private const float MoveSampleThresholdPixels = 0.5f;
-    private const float PenSampleThresholdPixels = 0.9f;
-    private const int MosaicBlockSize = 18;
-    private static readonly PointF[] EmptyPoints = new PointF[0];
-
-    private enum AnnotationUndoKind
-    {
-        Add,
-        Delete,
-        Transform
-    }
-
-    private enum SelectionHandle
-    {
-        None,
-        TopLeft,
-        Top,
-        TopRight,
-        Right,
-        BottomRight,
-        Bottom,
-        BottomLeft,
-        Left
-    }
-
-    private sealed class AnnotationSnapshot
-    {
-        public ToolMode Tool;
-        public PointF Start;
-        public PointF End;
-        public Color StrokeColor;
-        public float StrokeWidth;
-        public PointF[] Points = EmptyPoints;
-        public string Text;
-    }
-
-    private sealed class AnnotationUndoAction
-    {
-        public readonly AnnotationUndoKind Kind;
-        public readonly AnnotationItem Item;
-        public readonly int Index;
-        public readonly AnnotationSnapshot Before;
-
-        public AnnotationUndoAction(AnnotationUndoKind kind, AnnotationItem item, int index)
-            : this(kind, item, index, null)
-        {
-        }
-
-        public AnnotationUndoAction(AnnotationUndoKind kind, AnnotationItem item, int index, AnnotationSnapshot before)
-        {
-            Kind = kind;
-            Item = item;
-            Index = index;
-            Before = before;
-        }
-    }
-
-    public AnnotatorForm(string path, Bitmap image, string outputDirectory)
-    {
-        imagePath = path;
-        this.outputDirectory = outputDirectory;
-        baseImage = image;
-        canvasRenderScheduler = new AnimationFrameScheduler(InvalidateCanvasNow);
-        imePositionThrottle = AppUtilities.Throttle(PositionImeHostAtCaret, AppStyles.AnimationFrameMilliseconds);
-
-        Text = "图片标注";
-        windowIcon = LoadAppIcon();
-        if (windowIcon != null)
-        {
-            Icon = windowIcon;
-        }
-        StartPosition = FormStartPosition.CenterScreen;
-        WindowState = FormWindowState.Normal;
-        Size = GetInitialWindowSize(image);
-        MinimumSize = new Size(640, 420);
-        BackColor = AppStyles.AppBackground;
-        Font = new Font(AppStyles.UiFontName, 9f);
-        KeyPreview = true;
-        DoubleBuffered = true;
-
-        toolbar.Dock = DockStyle.Top;
-        toolbar.Height = AppStyles.ToolbarHeight;
-        toolbar.Padding = Padding.Empty;
-        toolbar.BackColor = AppStyles.AppBackground;
-        Controls.Add(toolbar);
-
-        canvas.Dock = DockStyle.Fill;
-        canvas.BackColor = AppStyles.CanvasBackground;
-        canvas.Cursor = Cursors.Cross;
-        canvas.Paint += Canvas_Paint;
-        canvas.MouseDown += Canvas_MouseDown;
-        canvas.MouseMove += Canvas_MouseMove;
-        canvas.MouseUp += Canvas_MouseUp;
-        canvas.MouseWheel += Canvas_MouseWheel;
-        canvas.Resize += delegate
-        {
-            ResetDisplayCache();
-            imePositionThrottle.Invoke();
-            RequestCanvasRender();
-        };
-        Controls.Add(canvas);
-
-        toolbarToolTip.InitialDelay = 350;
-        toolbarToolTip.ReshowDelay = 120;
-        toolbarToolTip.AutoPopDelay = 4000;
-
-        BuildToolbar();
-
-        cacheRefreshTimer.Interval = 140;
-        cacheRefreshTimer.Tick += delegate
-        {
-            cacheRefreshTimer.Stop();
-            suspendDisplayCache = false;
-            ResetDisplayCache();
-            RequestCanvasRender();
-        };
-        inlineCaretTimer.Interval = 500;
-        inlineCaretTimer.Tick += delegate
-        {
-            if (!inlineTextEditing)
-            {
-                inlineCaretTimer.Stop();
-                return;
-            }
-            inlineCaretVisible = !inlineCaretVisible;
-            RequestCanvasRender();
-        };
-        KeyDown += AnnotatorForm_KeyDown;
-    }
-
-    private static Size GetInitialWindowSize(Bitmap image)
-    {
-        Rectangle work = Screen.PrimaryScreen.WorkingArea;
-        int maxW = Math.Max(640, (int)(work.Width * 0.72));
-        int maxH = Math.Max(420, (int)(work.Height * 0.78));
-        int minW = 720;
-        int minH = 520;
-
-        float scale = Math.Min((float)(maxW - 40) / image.Width, (float)(maxH - 84) / image.Height);
-        scale = Math.Min(1f, Math.Max(0.25f, scale));
-
-        int width = Math.Max(minW, Math.Min(maxW, (int)Math.Round(image.Width * scale) + 40));
-        int height = Math.Max(minH, Math.Min(maxH, (int)Math.Round(image.Height * scale) + 84));
-        return new Size(width, height);
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            if (baseImage != null)
-            {
-                baseImage.Dispose();
-            }
-            cacheRefreshTimer.Stop();
-            cacheRefreshTimer.Dispose();
-            inlineCaretTimer.Stop();
-            inlineCaretTimer.Dispose();
-            DisposeInlineTextResources();
-            canvasRenderScheduler.Dispose();
-            imePositionThrottle.Dispose();
-            toolbarToolTip.Dispose();
-            if (windowIcon != null)
-            {
-                windowIcon.Dispose();
-                windowIcon = null;
-            }
-            ResetMoveBackgroundCache();
-            ResetDisplayCache();
-        }
-        base.Dispose(disposing);
-    }
-
-    private static Icon LoadAppIcon()
-    {
-        try
-        {
-            string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "AppIcon.ico");
-            if (File.Exists(iconPath))
-            {
-                return new Icon(iconPath);
-            }
-
-            string exePath = Application.ExecutablePath;
-            if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
-            {
-                return Icon.ExtractAssociatedIcon(exePath);
-            }
-        }
-        catch
-        {
-        }
-
-        return null;
-    }
-
-    private static float ClampZoom(float value)
-    {
-        return Math.Max(0.25f, Math.Min(8f, value));
-    }
-
-    private void ResetZoom()
-    {
-        zoomFactor = 1f;
-        viewOffset = PointF.Empty;
-        suspendDisplayCache = false;
-        cacheRefreshTimer.Stop();
-        ResetDisplayCache();
-        RequestCanvasRender();
-    }
-
-    private void RequestCanvasRender()
-    {
-        canvasRenderScheduler.RequestFrame();
-    }
-
-    private void InvalidateCanvasNow()
-    {
-        if (!IsDisposed && canvas.IsHandleCreated)
-        {
-            canvas.Invalidate();
-        }
-    }
-
-    private RectangleF GetView()
-    {
-        float cw = Math.Max(1, canvas.ClientSize.Width);
-        float ch = Math.Max(1, canvas.ClientSize.Height);
-        float fitScale = Math.Min(cw / baseImage.Width, ch / baseImage.Height);
-        float scale = fitScale * zoomFactor;
-        float w = baseImage.Width * scale;
-        float h = baseImage.Height * scale;
-        return new RectangleF((cw - w) / 2f + viewOffset.X, (ch - h) / 2f + viewOffset.Y, w, h);
-    }
-
-    private float GetScale()
-    {
-        RectangleF view = GetView();
-        return view.Width / baseImage.Width;
-    }
-
-    private void ResetDisplayCache()
-    {
-        if (displayCache != null)
-        {
-            displayCache.Dispose();
-            displayCache = null;
-            displayCacheSize = Size.Empty;
-        }
-    }
-
-    private void ResetMoveBackgroundCache()
-    {
-        if (moveBackgroundCache != null)
-        {
-            moveBackgroundCache.Dispose();
-            moveBackgroundCache = null;
-            moveBackgroundCacheSize = Size.Empty;
-        }
-    }
-
-    private void MarkAnnotationsChanged()
-    {
-        annotationsChanged = true;
-    }
-
-    private void SuspendDisplayCacheForInteraction()
-    {
-        suspendDisplayCache = true;
-        cacheRefreshTimer.Stop();
-    }
-
-    private void ResumeDisplayCacheAfterInteraction(bool changed)
-    {
-        suspendDisplayCache = false;
-        cacheRefreshTimer.Stop();
-        ResetMoveBackgroundCache();
-        if (changed)
-        {
-            MarkAnnotationsChanged();
-        }
-    }
-
-    private float CanvasPixelsToImageDistance(float pixels)
-    {
-        float scale = GetScale();
-        if (scale <= 0)
-        {
-            return pixels;
-        }
-        return Math.Max(0.01f, pixels / scale);
-    }
-
-    private bool CanUseDisplayCache(RectangleF view)
-    {
-        if (view.Width <= 0 || view.Height <= 0)
-        {
-            return false;
-        }
-        return (double)view.Width * view.Height <= MaxCachePixels;
-    }
-
-    private void EnsureDisplayCache(RectangleF view)
-    {
-        var targetSize = new Size(
-            Math.Max(1, (int)Math.Round(view.Width)),
-            Math.Max(1, (int)Math.Round(view.Height)));
-
-        if (displayCache != null && displayCacheSize == targetSize && !annotationsChanged)
-        {
-            return;
-        }
-
-        ResetDisplayCache();
-        displayCache = new Bitmap(targetSize.Width, targetSize.Height);
-        displayCacheSize = targetSize;
-        annotationsChanged = false;
-
-        float displayScale = targetSize.Width / (float)baseImage.Width;
-
-        using (Graphics g = Graphics.FromImage(displayCache))
-        {
-            g.Clear(AppStyles.CanvasBackground);
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.DrawImage(baseImage, new Rectangle(0, 0, targetSize.Width, targetSize.Height));
-
-            if (items.Count > 0)
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.ScaleTransform(displayScale, displayScale, MatrixOrder.Prepend);
-                DrawAnnotations(g, displayScale, -1);
-            }
-        }
-    }
-
-    private void EnsureMoveBackgroundCache(RectangleF view)
-    {
-        if (!HasSelectedItem() || !CanUseDisplayCache(view))
-        {
-            ResetMoveBackgroundCache();
-            return;
-        }
-
-        var targetSize = new Size(
-            Math.Max(1, (int)Math.Round(view.Width)),
-            Math.Max(1, (int)Math.Round(view.Height)));
-
-        if (moveBackgroundCache != null && moveBackgroundCacheSize == targetSize)
-        {
-            return;
-        }
-
-        ResetMoveBackgroundCache();
-        moveBackgroundCache = new Bitmap(targetSize.Width, targetSize.Height);
-        moveBackgroundCacheSize = targetSize;
-
-        float displayScale = targetSize.Width / (float)baseImage.Width;
-        using (Graphics g = Graphics.FromImage(moveBackgroundCache))
-        {
-            g.Clear(AppStyles.CanvasBackground);
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.DrawImage(baseImage, new Rectangle(0, 0, targetSize.Width, targetSize.Height));
-
-            if (items.Count > 0)
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.ScaleTransform(displayScale, displayScale, MatrixOrder.Prepend);
-                DrawAnnotations(g, displayScale, selectedItemIndex);
-            }
-        }
-    }
-
-    private void DrawAnnotations(Graphics g, float scale, int skipIndex)
-    {
-        for (int i = 0; i < items.Count; i++)
-        {
-            if (i == skipIndex)
-            {
-                continue;
-            }
-
-            DrawItem(g, items[i], scale);
-        }
-    }
-
-    private PointF ToImagePoint(Point point)
-    {
-        RectangleF view = GetView();
-        float scale = GetScale();
-        float x = (point.X - view.X) / scale;
-        float y = (point.Y - view.Y) / scale;
-        x = Math.Max(0, Math.Min(baseImage.Width, x));
-        y = Math.Max(0, Math.Min(baseImage.Height, y));
-        return new PointF(x, y);
-    }
-
-    private void SetZoomKeepingAnchor(float newZoom, Point screenPoint, PointF imagePoint)
-    {
-        zoomFactor = ClampZoom(newZoom);
-        RectangleF view = GetView();
-        float scale = GetScale();
-        viewOffset.X += screenPoint.X - (view.X + imagePoint.X * scale);
-        viewOffset.Y += screenPoint.Y - (view.Y + imagePoint.Y * scale);
-        PositionImeHostAtCaret();
-    }
-
-    private void Canvas_Paint(object sender, PaintEventArgs e)
-    {
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.InterpolationMode = InterpolationMode.Bilinear;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-        RectangleF view = GetView();
-        int viewX = (int)Math.Round(view.X);
-        int viewY = (int)Math.Round(view.Y);
-        float scale = view.Width / baseImage.Width;
-        bool editingSelection = IsEditingSelection();
-        bool drewMovingBackground = false;
-        if (editingSelection)
-        {
-            EnsureMoveBackgroundCache(view);
-            if (moveBackgroundCache != null)
-            {
-                scale = (float)moveBackgroundCache.Width / baseImage.Width;
-                e.Graphics.DrawImageUnscaled(moveBackgroundCache, viewX, viewY);
-                drewMovingBackground = true;
-            }
-        }
-
-        if (!drewMovingBackground && !suspendDisplayCache && CanUseDisplayCache(view))
-        {
-            EnsureDisplayCache(view);
-            scale = (float)displayCache.Width / baseImage.Width;
-            e.Graphics.DrawImageUnscaled(displayCache, viewX, viewY);
-        }
-        else if (!drewMovingBackground)
-        {
-            DrawVisibleImageRegion(e.Graphics, view, scale);
-
-            GraphicsState slowState = e.Graphics.Save();
-            e.Graphics.TranslateTransform(viewX, viewY, MatrixOrder.Prepend);
-            e.Graphics.ScaleTransform(scale, scale, MatrixOrder.Prepend);
-            DrawAnnotations(e.Graphics, scale, editingSelection ? selectedItemIndex : -1);
-            e.Graphics.Restore(slowState);
-        }
-
-        GraphicsState state = e.Graphics.Save();
-        e.Graphics.TranslateTransform(viewX, viewY, MatrixOrder.Prepend);
-        e.Graphics.ScaleTransform(scale, scale, MatrixOrder.Prepend);
-
-        if (drawing)
-        {
-            if (currentTool == ToolMode.Pen && currentPenItem != null && currentPenItem.Points.Count > 1)
-            {
-                DrawItem(e.Graphics, currentPenItem, scale);
-            }
-            else if (currentTool != ToolMode.Pen)
-            {
-                var preview = new AnnotationItem();
-                preview.Tool = currentTool;
-                preview.Start = startPoint;
-                preview.End = currentPoint;
-                preview.StrokeColor = strokeColor;
-                preview.StrokeWidth = strokeWidth;
-                DrawItem(e.Graphics, preview, scale);
-            }
-        }
-
-        if (editingSelection)
-        {
-            AnnotationItem preview = GetSelectionPreviewItem();
-            if (preview != null)
-            {
-                DrawItem(e.Graphics, preview, scale);
-                DrawSelection(e.Graphics, preview, scale);
-            }
-        }
-        else if (HasSelectedItem())
-        {
-            DrawSelection(e.Graphics, items[selectedItemIndex], scale);
-        }
-
-        if (inlineTextEditing)
-        {
-            DrawInlineTextInput(e.Graphics, scale);
-        }
-
-        e.Graphics.Restore(state);
-    }
-
-    private void DrawVisibleImageRegion(Graphics g, RectangleF view, float scale)
-    {
-        RectangleF visibleCanvas = new RectangleF(0, 0, canvas.ClientSize.Width, canvas.ClientSize.Height);
-        RectangleF clippedView = RectangleF.Intersect(view, visibleCanvas);
-        if (clippedView.Width <= 0 || clippedView.Height <= 0)
-        {
-            return;
-        }
-
-        RectangleF src = new RectangleF(
-            (clippedView.X - view.X) / scale,
-            (clippedView.Y - view.Y) / scale,
-            clippedView.Width / scale,
-            clippedView.Height / scale);
-
-        g.DrawImage(baseImage, clippedView, src, GraphicsUnit.Pixel);
-    }
-
-    private void DrawItem(Graphics g, AnnotationItem item, float scale)
-    {
-        if (item == null || scale <= 0)
-        {
-            return;
-        }
-
-        Color itemColor = item.StrokeColor.IsEmpty ? strokeColor : item.StrokeColor;
-        float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
-
-        if (item.Tool == ToolMode.Arrow)
-        {
-            DrawFilledArrow(g, item, itemColor, itemWidth);
-            return;
-        }
-
-        if (item.Tool == ToolMode.Text)
-        {
-            DrawTextAnnotation(g, item, itemColor, itemWidth);
-            return;
-        }
-
-        if (item.Tool == ToolMode.Mosaic)
-        {
-            DrawMosaic(g, item);
-            return;
-        }
-
-        using (var pen = new Pen(itemColor, Math.Max(0.1f, itemWidth)))
-        {
-            pen.StartCap = LineCap.Round;
-            pen.EndCap = LineCap.Round;
-            pen.LineJoin = LineJoin.Round;
-
-            if (item.Tool == ToolMode.Rect)
-            {
-                float x = Math.Min(item.Start.X, item.End.X);
-                float y = Math.Min(item.Start.Y, item.End.Y);
-                float w = Math.Abs(item.End.X - item.Start.X);
-                float h = Math.Abs(item.End.Y - item.Start.Y);
-                g.DrawRectangle(pen, x, y, w, h);
-            }
-            else if (item.Tool == ToolMode.Ellipse)
-            {
-                float x = Math.Min(item.Start.X, item.End.X);
-                float y = Math.Min(item.Start.Y, item.End.Y);
-                float w = Math.Abs(item.End.X - item.Start.X);
-                float h = Math.Abs(item.End.Y - item.Start.Y);
-                g.DrawEllipse(pen, x, y, w, h);
-            }
-            else if (item.Tool == ToolMode.Pen && item.Points.Count > 1)
-            {
-                g.DrawLines(pen, item.GetDrawingPoints());
-            }
-        }
-    }
-
-    private static void DrawTextAnnotation(Graphics g, AnnotationItem item, Color color, float width)
-    {
-        if (string.IsNullOrEmpty(item.Text))
-        {
-            return;
-        }
-
-        float fontSize = Math.Max(1f, width * 6f);
-        using (Font font = new Font(AppStyles.UiFontName, fontSize, FontStyle.Bold))
-        using (Brush textBrush = new SolidBrush(color))
-        {
-            g.DrawString(item.Text, font, textBrush, item.Start);
-        }
-    }
-
-    private static void DrawFilledArrow(Graphics g, AnnotationItem item, Color color, float width)
-    {
-        PointF[] points = BuildFilledArrowPoints(item, width);
-        if (points.Length == 0)
-        {
-            return;
-        }
-
-        using (Brush brush = new SolidBrush(color))
-        {
-            g.FillPolygon(brush, points);
-        }
-    }
-
-    private static PointF[] BuildFilledArrowPoints(AnnotationItem item, float width)
-    {
-        float dx = item.End.X - item.Start.X;
-        float dy = item.End.Y - item.Start.Y;
-        float length = (float)Math.Sqrt(dx * dx + dy * dy);
-        if (length < MinAnnotationExtent)
-        {
-            return EmptyPoints;
-        }
-
-        float ux = dx / length;
-        float uy = dy / length;
-        float nx = -uy;
-        float ny = ux;
-
-        float headLength = Math.Min(length * 0.55f, Math.Max(14f, width * 5.5f));
-        float tailHalf = Math.Max(0.7f, width * 0.22f);
-        float neckHalf = Math.Max(1.2f, width * 0.65f);
-        float headHalf = Math.Max(neckHalf * 2.2f, width * 2.4f);
-
-        PointF neck = new PointF(
-            item.End.X - ux * headLength,
-            item.End.Y - uy * headLength);
-
-        return new PointF[]
-        {
-            OffsetPoint(item.Start, nx, ny, -tailHalf),
-            OffsetPoint(neck, nx, ny, -neckHalf),
-            OffsetPoint(neck, nx, ny, -headHalf),
-            item.End,
-            OffsetPoint(neck, nx, ny, headHalf),
-            OffsetPoint(neck, nx, ny, neckHalf),
-            OffsetPoint(item.Start, nx, ny, tailHalf)
-        };
-    }
-
-    private static PointF OffsetPoint(PointF point, float normalX, float normalY, float distance)
-    {
-        return new PointF(point.X + normalX * distance, point.Y + normalY * distance);
-    }
-
-    private void DrawSelection(Graphics g, AnnotationItem item, float scale)
-    {
-        RectangleF bounds = GetSelectionFrameBounds(item, scale);
-        if (bounds.IsEmpty)
-        {
-            return;
-        }
-
-        float safeScale = Math.Max(0.001f, scale);
-        float lineWidth = Math.Max(0.1f, 1.25f / safeScale);
-        using (Pen pen = new Pen(AppStyles.OptionSelectedForeground, lineWidth))
-        using (Brush handleBrush = new SolidBrush(Color.White))
-        using (Pen handlePen = new Pen(AppStyles.OptionSelectedForeground, lineWidth))
-        {
-            pen.DashStyle = DashStyle.Dash;
-            g.DrawRectangle(pen, bounds.X, bounds.Y, bounds.Width, bounds.Height);
-
-            if (!CanResizeAnnotation(item))
-            {
-                return;
-            }
-
-            float handleSize = Math.Max(3f, 7f / safeScale);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Top, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left + bounds.Width / 2f, bounds.Top, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Top, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Top + bounds.Height / 2f, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Right, bounds.Bottom, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left + bounds.Width / 2f, bounds.Bottom, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Bottom, handleSize);
-            DrawSelectionHandle(g, handleBrush, handlePen, bounds.Left, bounds.Top + bounds.Height / 2f, handleSize);
-        }
-    }
-
-    private static void DrawSelectionHandle(Graphics g, Brush brush, Pen pen, float x, float y, float size)
-    {
-        RectangleF rect = new RectangleF(x - size / 2f, y - size / 2f, size, size);
-        g.FillEllipse(brush, rect);
-        g.DrawEllipse(pen, rect);
-    }
-
-    private RectangleF GetSelectionFrameBounds(AnnotationItem item)
-    {
-        return GetSelectionFrameBounds(item, GetScale());
-    }
-
-    private RectangleF GetSelectionFrameBounds(AnnotationItem item, float scale)
-    {
-        RectangleF bounds = GetItemBounds(item);
-        if (bounds.IsEmpty)
-        {
-            return bounds;
-        }
-
-        float safeScale = Math.Max(0.001f, scale);
-        float padding = Math.Max(2f, 4f / safeScale);
-        bounds.Inflate(padding, padding);
-        return bounds;
-    }
-
-    private static bool CanResizeAnnotation(AnnotationItem item)
-    {
-        return item != null && item.Tool != ToolMode.Text;
-    }
-
-    private SelectionHandle HitTestSelectionHandle(PointF point)
-    {
-        if (!HasSelectedItem())
-        {
-            return SelectionHandle.None;
-        }
-
-        AnnotationItem item = items[selectedItemIndex];
-        if (!CanResizeAnnotation(item))
-        {
-            return SelectionHandle.None;
-        }
-
-        RectangleF bounds = GetSelectionFrameBounds(item);
-        if (bounds.IsEmpty)
-        {
-            return SelectionHandle.None;
-        }
-
-        float radius = GetSelectionHandleHitRadius();
-        SelectionHandle[] handles = new SelectionHandle[]
-        {
-            SelectionHandle.TopLeft,
-            SelectionHandle.TopRight,
-            SelectionHandle.BottomRight,
-            SelectionHandle.BottomLeft,
-            SelectionHandle.Top,
-            SelectionHandle.Right,
-            SelectionHandle.Bottom,
-            SelectionHandle.Left
-        };
-
-        for (int i = 0; i < handles.Length; i++)
-        {
-            if (IsPointInSelectionHandle(point, GetSelectionHandlePoint(bounds, handles[i]), radius))
-            {
-                return handles[i];
-            }
-        }
-
-        return SelectionHandle.None;
-    }
-
-    private float GetSelectionHandleHitRadius()
-    {
-        float scale = GetScale();
-        if (scale <= 0)
-        {
-            return 8f;
-        }
-
-        return Math.Max(4f, 8f / scale);
-    }
-
-    private static bool IsPointInSelectionHandle(PointF point, PointF handlePoint, float radius)
-    {
-        float dx = point.X - handlePoint.X;
-        float dy = point.Y - handlePoint.Y;
-        return dx * dx + dy * dy <= radius * radius;
-    }
-
-    private static PointF GetSelectionHandlePoint(RectangleF bounds, SelectionHandle handle)
-    {
-        switch (handle)
-        {
-            case SelectionHandle.TopLeft:
-                return new PointF(bounds.Left, bounds.Top);
-            case SelectionHandle.Top:
-                return new PointF(bounds.Left + bounds.Width / 2f, bounds.Top);
-            case SelectionHandle.TopRight:
-                return new PointF(bounds.Right, bounds.Top);
-            case SelectionHandle.Right:
-                return new PointF(bounds.Right, bounds.Top + bounds.Height / 2f);
-            case SelectionHandle.BottomRight:
-                return new PointF(bounds.Right, bounds.Bottom);
-            case SelectionHandle.Bottom:
-                return new PointF(bounds.Left + bounds.Width / 2f, bounds.Bottom);
-            case SelectionHandle.BottomLeft:
-                return new PointF(bounds.Left, bounds.Bottom);
-            case SelectionHandle.Left:
-                return new PointF(bounds.Left, bounds.Top + bounds.Height / 2f);
-            default:
-                return PointF.Empty;
-        }
-    }
-
-    private static Cursor GetSelectionHandleCursor(SelectionHandle handle)
-    {
-        switch (handle)
-        {
-            case SelectionHandle.TopLeft:
-            case SelectionHandle.BottomRight:
-                return Cursors.SizeNWSE;
-            case SelectionHandle.TopRight:
-            case SelectionHandle.BottomLeft:
-                return Cursors.SizeNESW;
-            case SelectionHandle.Top:
-            case SelectionHandle.Bottom:
-                return Cursors.SizeNS;
-            case SelectionHandle.Left:
-            case SelectionHandle.Right:
-                return Cursors.SizeWE;
-            default:
-                return Cursors.Cross;
-        }
-    }
-
-    private RectangleF GetItemBounds(AnnotationItem item)
-    {
-        if (item == null)
-        {
-            return RectangleF.Empty;
-        }
-
-        float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
-        RectangleF bounds;
-        if (item.Tool == ToolMode.Rect || item.Tool == ToolMode.Ellipse || item.Tool == ToolMode.Mosaic)
-        {
-            bounds = NormalizeRect(item.Start, item.End);
-        }
-        else if (item.Tool == ToolMode.Arrow)
-        {
-            bounds = BoundsFromPoints(item.Start, item.End);
-            bounds.Inflate(Math.Max(6f, itemWidth * 3f), Math.Max(6f, itemWidth * 3f));
-        }
-        else if (item.Tool == ToolMode.Pen)
-        {
-            bounds = GetPointsBounds(item.Points);
-            bounds.Inflate(Math.Max(2f, itemWidth), Math.Max(2f, itemWidth));
-        }
-        else if (item.Tool == ToolMode.Text)
-        {
-            bounds = GetTextBounds(item);
-        }
-        else
-        {
-            bounds = BoundsFromPoints(item.Start, item.End);
-        }
-
-        if (bounds.Width < 1f)
-        {
-            bounds.Inflate(0.5f, 0f);
-        }
-        if (bounds.Height < 1f)
-        {
-            bounds.Inflate(0f, 0.5f);
-        }
-        return bounds;
-    }
-
-    private static RectangleF GetPointsBounds(List<PointF> points)
-    {
-        if (points == null || points.Count == 0)
-        {
-            return RectangleF.Empty;
-        }
-
-        float left = points[0].X;
-        float right = points[0].X;
-        float top = points[0].Y;
-        float bottom = points[0].Y;
-        for (int i = 1; i < points.Count; i++)
-        {
-            left = Math.Min(left, points[i].X);
-            right = Math.Max(right, points[i].X);
-            top = Math.Min(top, points[i].Y);
-            bottom = Math.Max(bottom, points[i].Y);
-        }
-        return RectangleF.FromLTRB(left, top, right, bottom);
-    }
-
-    private static RectangleF BoundsFromPoints(PointF a, PointF b)
-    {
-        return RectangleF.FromLTRB(
-            Math.Min(a.X, b.X),
-            Math.Min(a.Y, b.Y),
-            Math.Max(a.X, b.X),
-            Math.Max(a.Y, b.Y));
-    }
-
-    private static RectangleF NormalizeRect(PointF a, PointF b)
-    {
-        float x = Math.Min(a.X, b.X);
-        float y = Math.Min(a.Y, b.Y);
-        float w = Math.Abs(a.X - b.X);
-        float h = Math.Abs(a.Y - b.Y);
-        return new RectangleF(x, y, w, h);
-    }
-
-    private static bool IsMeaningfulAnnotation(AnnotationItem item)
-    {
-        if (item == null)
-        {
-            return false;
-        }
-
-        if (item.Tool == ToolMode.Arrow)
-        {
-            return Distance(item.Start, item.End) >= MinAnnotationExtent;
-        }
-
-        if (item.Tool == ToolMode.Rect || item.Tool == ToolMode.Ellipse || item.Tool == ToolMode.Mosaic)
-        {
-            RectangleF rect = NormalizeRect(item.Start, item.End);
-            return rect.Width >= MinAnnotationExtent && rect.Height >= MinAnnotationExtent;
-        }
-
-        if (item.Tool == ToolMode.Pen)
-        {
-            if (item.Points.Count < 2)
-            {
-                return false;
-            }
-
-            PointF first = item.Points[0];
-            for (int i = 1; i < item.Points.Count; i++)
-            {
-                if (Distance(first, item.Points[i]) >= MinAnnotationExtent)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        return true;
-    }
-
-    private static float Distance(PointF a, PointF b)
-    {
-        float dx = a.X - b.X;
-        float dy = a.Y - b.Y;
-        return (float)Math.Sqrt(dx * dx + dy * dy);
-    }
-
-    private bool IsEditingSelection()
-    {
-        return HasSelectedItem() && (movingSelection || resizingSelection);
-    }
-
-    private AnnotationItem GetSelectionPreviewItem()
-    {
-        if (!HasSelectedItem())
-        {
-            return null;
-        }
-
-        AnnotationSnapshot snapshot = selectionEditStartState ?? CaptureAnnotation(items[selectedItemIndex]);
-        AnnotationItem preview = CreateAnnotationItem(snapshot);
-        PointF offset = GetMoveOffset();
-        if (movingSelection)
-        {
-            preview.MoveBy(offset.X, offset.Y);
-        }
-        else if (resizingSelection)
-        {
-            ApplyResizeToAnnotation(preview, snapshot, selectionEditStartBounds, activeSelectionHandle, offset);
-        }
-        return preview;
-    }
-
-    private static AnnotationSnapshot CaptureAnnotation(AnnotationItem item)
-    {
-        if (item == null)
-        {
-            return null;
-        }
-
-        return new AnnotationSnapshot
-        {
-            Tool = item.Tool,
-            Start = item.Start,
-            End = item.End,
-            StrokeColor = item.StrokeColor,
-            StrokeWidth = item.StrokeWidth,
-            Points = item.Points.ToArray(),
-            Text = item.Text
-        };
-    }
-
-    private static AnnotationItem CreateAnnotationItem(AnnotationSnapshot snapshot)
-    {
-        if (snapshot == null)
-        {
-            return null;
-        }
-
-        var item = new AnnotationItem();
-        ApplyAnnotationSnapshot(item, snapshot);
-        return item;
-    }
-
-    private static void ApplyAnnotationSnapshot(AnnotationItem item, AnnotationSnapshot snapshot)
-    {
-        if (item == null || snapshot == null)
-        {
-            return;
-        }
-
-        item.Tool = snapshot.Tool;
-        item.Start = snapshot.Start;
-        item.End = snapshot.End;
-        item.StrokeColor = snapshot.StrokeColor;
-        item.StrokeWidth = snapshot.StrokeWidth;
-        item.Text = snapshot.Text;
-        item.SetPoints(snapshot.Points);
-    }
-
-    private bool RecordTransformUndo(AnnotationItem item, int index, AnnotationSnapshot before, AnnotationSnapshot after)
-    {
-        if (item == null || before == null || after == null || AnnotationSnapshotsEqual(before, after))
-        {
-            return false;
-        }
-
-        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Transform, item, index, before));
-        MarkAnnotationsChanged();
-        return true;
-    }
-
-    private static bool AnnotationSnapshotsEqual(AnnotationSnapshot a, AnnotationSnapshot b)
-    {
-        if (a == null || b == null)
-        {
-            return a == b;
-        }
-
-        if (a.Tool != b.Tool ||
-            !SamePoint(a.Start, b.Start) ||
-            !SamePoint(a.End, b.End) ||
-            a.StrokeColor.ToArgb() != b.StrokeColor.ToArgb() ||
-            Math.Abs(a.StrokeWidth - b.StrokeWidth) > 0.001f ||
-            !string.Equals(a.Text ?? string.Empty, b.Text ?? string.Empty, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        PointF[] aPoints = a.Points ?? EmptyPoints;
-        PointF[] bPoints = b.Points ?? EmptyPoints;
-        if (aPoints.Length != bPoints.Length)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < aPoints.Length; i++)
-        {
-            if (!SamePoint(aPoints[i], bPoints[i]))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool SamePoint(PointF a, PointF b)
-    {
-        return Math.Abs(a.X - b.X) <= 0.001f && Math.Abs(a.Y - b.Y) <= 0.001f;
-    }
-
-    private static void ApplyResizeToAnnotation(AnnotationItem item, AnnotationSnapshot originalState, RectangleF originalBounds, SelectionHandle handle, PointF offset)
-    {
-        if (item == null || originalState == null || handle == SelectionHandle.None || originalBounds.IsEmpty)
-        {
-            return;
-        }
-
-        ApplyAnnotationSnapshot(item, originalState);
-        RectangleF targetBounds = GetResizedBounds(originalBounds, handle, offset);
-        TransformAnnotationToBounds(item, originalBounds, targetBounds);
-    }
-
-    private static RectangleF GetResizedBounds(RectangleF originalBounds, SelectionHandle handle, PointF offset)
-    {
-        float left = originalBounds.Left;
-        float top = originalBounds.Top;
-        float right = originalBounds.Right;
-        float bottom = originalBounds.Bottom;
-
-        if (HandleAffectsLeft(handle))
-        {
-            left += offset.X;
-        }
-        if (HandleAffectsRight(handle))
-        {
-            right += offset.X;
-        }
-        if (HandleAffectsTop(handle))
-        {
-            top += offset.Y;
-        }
-        if (HandleAffectsBottom(handle))
-        {
-            bottom += offset.Y;
-        }
-
-        if (right - left < MinAnnotationExtent)
-        {
-            if (HandleAffectsLeft(handle))
-            {
-                left = right - MinAnnotationExtent;
-            }
-            else
-            {
-                right = left + MinAnnotationExtent;
-            }
-        }
-
-        if (bottom - top < MinAnnotationExtent)
-        {
-            if (HandleAffectsTop(handle))
-            {
-                top = bottom - MinAnnotationExtent;
-            }
-            else
-            {
-                bottom = top + MinAnnotationExtent;
-            }
-        }
-
-        return RectangleF.FromLTRB(left, top, right, bottom);
-    }
-
-    private static bool HandleAffectsLeft(SelectionHandle handle)
-    {
-        return handle == SelectionHandle.TopLeft || handle == SelectionHandle.BottomLeft || handle == SelectionHandle.Left;
-    }
-
-    private static bool HandleAffectsRight(SelectionHandle handle)
-    {
-        return handle == SelectionHandle.TopRight || handle == SelectionHandle.BottomRight || handle == SelectionHandle.Right;
-    }
-
-    private static bool HandleAffectsTop(SelectionHandle handle)
-    {
-        return handle == SelectionHandle.TopLeft || handle == SelectionHandle.TopRight || handle == SelectionHandle.Top;
-    }
-
-    private static bool HandleAffectsBottom(SelectionHandle handle)
-    {
-        return handle == SelectionHandle.BottomLeft || handle == SelectionHandle.BottomRight || handle == SelectionHandle.Bottom;
-    }
-
-    private static void TransformAnnotationToBounds(AnnotationItem item, RectangleF sourceBounds, RectangleF targetBounds)
-    {
-        if (item.Tool == ToolMode.Rect || item.Tool == ToolMode.Ellipse || item.Tool == ToolMode.Mosaic)
-        {
-            item.Start = new PointF(targetBounds.Left, targetBounds.Top);
-            item.End = new PointF(targetBounds.Right, targetBounds.Bottom);
-            return;
-        }
-
-        item.Start = TransformPointToBounds(item.Start, sourceBounds, targetBounds);
-        item.End = TransformPointToBounds(item.End, sourceBounds, targetBounds);
-
-        if (item.Points.Count > 0)
-        {
-            PointF[] points = new PointF[item.Points.Count];
-            for (int i = 0; i < item.Points.Count; i++)
-            {
-                points[i] = TransformPointToBounds(item.Points[i], sourceBounds, targetBounds);
-            }
-            item.SetPoints(points);
-        }
-    }
-
-    private static PointF TransformPointToBounds(PointF point, RectangleF sourceBounds, RectangleF targetBounds)
-    {
-        float xRatio = sourceBounds.Width <= 0.0001f ? 0.5f : (point.X - sourceBounds.Left) / sourceBounds.Width;
-        float yRatio = sourceBounds.Height <= 0.0001f ? 0.5f : (point.Y - sourceBounds.Top) / sourceBounds.Height;
-        return new PointF(
-            targetBounds.Left + xRatio * targetBounds.Width,
-            targetBounds.Top + yRatio * targetBounds.Height);
-    }
-
-    private void ResetSelectionEditState()
-    {
-        movingSelection = false;
-        resizingSelection = false;
-        activeSelectionHandle = SelectionHandle.None;
-        selectionMoved = false;
-        selectionEditStartState = null;
-        selectionEditStartBounds = RectangleF.Empty;
-    }
-
-    private bool HasSelectedItem()
-    {
-        return selectedItemIndex >= 0 && selectedItemIndex < items.Count;
-    }
-
-    private void ClearSelection()
-    {
-        bool wasEditing = movingSelection || resizingSelection;
-        bool moved = selectionMoved;
-        selectedItemIndex = -1;
-        ResetSelectionEditState();
-        if (wasEditing)
-        {
-            ResumeDisplayCacheAfterInteraction(moved);
-        }
-    }
-
-    private void SelectAnnotation(int index)
-    {
-        if (index < 0 || index >= items.Count)
-        {
-            ClearSelection();
-            return;
-        }
-
-        selectedItemIndex = index;
-        ResetSelectionEditState();
-    }
-
-    private void AddAnnotation(AnnotationItem item)
-    {
-        if (item == null)
-        {
-            return;
-        }
-
-        int index = items.Count;
-        items.Add(item);
-        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Add, item, index));
-        SelectAnnotation(index);
-        MarkAnnotationsChanged();
-    }
-
-    private bool DeleteSelectedAnnotation()
-    {
-        if (!HasSelectedItem())
-        {
-            return false;
-        }
-
-        int index = selectedItemIndex;
-        AnnotationItem item = items[index];
-        items.RemoveAt(index);
-        undoStack.Push(new AnnotationUndoAction(AnnotationUndoKind.Delete, item, index));
-        ClearSelection();
-        MarkAnnotationsChanged();
-        RequestCanvasRender();
-        return true;
-    }
-
-    private void UndoAnnotationAction()
-    {
-        if (undoStack.Count > 0)
-        {
-            AnnotationUndoAction action = undoStack.Pop();
-            if (action.Kind == AnnotationUndoKind.Add)
-            {
-                int index = items.IndexOf(action.Item);
-                if (index >= 0)
-                {
-                    items.RemoveAt(index);
-                    if (selectedItemIndex == index)
-                    {
-                        ClearSelection();
-                    }
-                    else if (selectedItemIndex > index)
-                    {
-                        selectedItemIndex--;
-                    }
-                }
-            }
-            else if (action.Kind == AnnotationUndoKind.Delete && action.Item != null)
-            {
-                int index = Math.Max(0, Math.Min(action.Index, items.Count));
-                items.Insert(index, action.Item);
-                SelectAnnotation(index);
-            }
-            else if (action.Kind == AnnotationUndoKind.Transform && action.Item != null && action.Before != null)
-            {
-                int index = items.IndexOf(action.Item);
-                if (index >= 0)
-                {
-                    ApplyAnnotationSnapshot(action.Item, action.Before);
-                    SelectAnnotation(index);
-                }
-            }
-
-            MarkAnnotationsChanged();
-            RequestCanvasRender();
-            return;
-        }
-
-        if (items.Count > 0)
-        {
-            items.RemoveAt(items.Count - 1);
-            if (selectedItemIndex >= items.Count)
-            {
-                ClearSelection();
-            }
-            MarkAnnotationsChanged();
-            RequestCanvasRender();
-        }
-    }
-
-    private void ClearAnnotations()
-    {
-        items.Clear();
-        undoStack.Clear();
-        ClearSelection();
-        MarkAnnotationsChanged();
-        RequestCanvasRender();
-    }
-
-    private bool ConfirmClearAnnotations()
-    {
-        if (items.Count == 0 && !inlineTextEditing)
-        {
-            return false;
-        }
-
-        DialogResult result = MessageBox.Show(
-            this,
-            "确定要清空当前标注内容吗？此操作无法撤销。",
-            "清空标注",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        return result == DialogResult.Yes;
-    }
-
-    private int HitTestAnnotation(PointF point)
-    {
-        float tolerance = GetSelectionHitTolerance();
-        for (int i = items.Count - 1; i >= 0; i--)
-        {
-            if (IsPointInAnnotation(point, items[i], tolerance))
-            {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private float GetSelectionHitTolerance()
-    {
-        float scale = GetScale();
-        if (scale <= 0)
-        {
-            return SelectionHitTolerancePixels;
-        }
-        return Math.Max(2f, SelectionHitTolerancePixels / scale);
-    }
-
-    private bool IsPointInAnnotation(PointF point, AnnotationItem item, float tolerance)
-    {
-        if (item == null)
-        {
-            return false;
-        }
-
-        float itemWidth = item.StrokeWidth > 0 ? item.StrokeWidth : strokeWidth;
-        if (item.Tool == ToolMode.Arrow)
-        {
-            return IsPointInFilledArrow(point, item, itemWidth, tolerance);
-        }
-
-        if (item.Tool == ToolMode.Pen)
-        {
-            if (item.Points.Count == 1)
-            {
-                return Distance(point, item.Points[0]) <= tolerance;
-            }
-
-            float threshold = Math.Max(tolerance, itemWidth * 0.75f);
-            for (int i = 1; i < item.Points.Count; i++)
-            {
-                if (DistanceToSegment(point, item.Points[i - 1], item.Points[i]) <= threshold)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (item.Tool == ToolMode.Rect)
-        {
-            return IsPointOnRectangle(point, NormalizeRect(item.Start, item.End), Math.Max(tolerance, itemWidth * 0.5f));
-        }
-
-        if (item.Tool == ToolMode.Ellipse)
-        {
-            return IsPointOnEllipse(point, NormalizeRect(item.Start, item.End), Math.Max(tolerance, itemWidth * 0.5f));
-        }
-
-        RectangleF bounds = GetItemBounds(item);
-        float hitPadding = item.Tool == ToolMode.Text ? tolerance : Math.Max(tolerance, itemWidth);
-        bounds.Inflate(hitPadding, hitPadding);
-        return bounds.Contains(point);
-    }
-
-    private static bool IsPointInFilledArrow(PointF point, AnnotationItem item, float itemWidth, float tolerance)
-    {
-        PointF[] points = BuildFilledArrowPoints(item, itemWidth);
-        if (points.Length == 0)
-        {
-            return false;
-        }
-
-        using (GraphicsPath path = new GraphicsPath())
-        using (Pen outlinePen = new Pen(Color.Black, Math.Max(1f, tolerance * 2f)))
-        {
-            path.AddPolygon(points);
-            return path.IsVisible(point) || path.IsOutlineVisible(point, outlinePen);
-        }
-    }
-
-    private static bool IsPointOnRectangle(PointF point, RectangleF rect, float tolerance)
-    {
-        if (rect.Width <= 0 || rect.Height <= 0)
-        {
-            return false;
-        }
-
-        RectangleF outer = rect;
-        outer.Inflate(tolerance, tolerance);
-        if (!outer.Contains(point))
-        {
-            return false;
-        }
-
-        RectangleF inner = rect;
-        inner.Inflate(-tolerance, -tolerance);
-        if (inner.Width <= 0 || inner.Height <= 0)
-        {
-            return true;
-        }
-        return !inner.Contains(point);
-    }
-
-    private static bool IsPointOnEllipse(PointF point, RectangleF rect, float tolerance)
-    {
-        if (rect.Width <= 0 || rect.Height <= 0)
-        {
-            return false;
-        }
-
-        using (GraphicsPath path = new GraphicsPath())
-        using (Pen pen = new Pen(Color.Black, Math.Max(1f, tolerance * 2f)))
-        {
-            path.AddEllipse(rect);
-            return path.IsOutlineVisible(point, pen);
-        }
-    }
-
-    private static float DistanceToSegment(PointF point, PointF a, PointF b)
-    {
-        float dx = b.X - a.X;
-        float dy = b.Y - a.Y;
-        float lengthSquared = dx * dx + dy * dy;
-        if (lengthSquared <= 0.0001f)
-        {
-            return Distance(point, a);
-        }
-
-        float t = ((point.X - a.X) * dx + (point.Y - a.Y) * dy) / lengthSquared;
-        t = Math.Max(0f, Math.Min(1f, t));
-        PointF projection = new PointF(a.X + t * dx, a.Y + t * dy);
-        return Distance(point, projection);
-    }
-
-    private static void MoveAnnotation(AnnotationItem item, float dx, float dy)
-    {
-        item.MoveBy(dx, dy);
-    }
-
-    private PointF GetMoveOffset()
-    {
-        return new PointF(moveCurrentPoint.X - moveStartPoint.X, moveCurrentPoint.Y - moveStartPoint.Y);
-    }
-
-    private bool AppendPenPointIfNeeded(AnnotationItem item, PointF point, float threshold)
-    {
-        if (item == null)
-        {
-            return false;
-        }
-
-        if (item.Points.Count == 0)
-        {
-            item.AddPoint(point);
-            return true;
-        }
-
-        PointF last = item.Points[item.Points.Count - 1];
-        if (Distance(last, point) < threshold)
-        {
-            return false;
-        }
-
-        item.AddPoint(point);
-        return true;
-    }
-
-    private Bitmap RenderFinalImage()
-    {
-        var result = new Bitmap(baseImage.Width, baseImage.Height);
-        using (Graphics g = Graphics.FromImage(result))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.DrawImage(baseImage, 0, 0, baseImage.Width, baseImage.Height);
-        }
-
-        foreach (AnnotationItem item in items)
-        {
-            if (item.Tool == ToolMode.Mosaic)
-            {
-                ApplyMosaic(result, item);
-            }
-            else
-            {
-                using (Graphics g = Graphics.FromImage(result))
-                {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    DrawItem(g, item, 1f);
-                }
-            }
-        }
-        return result;
-    }
-
-    private void SaveAndClose()
-    {
-        try
-        {
-            if (inlineTextEditing)
-            {
-                HideInlineTextInput(true);
-            }
-
-            using (Bitmap result = RenderFinalImage())
-            {
-                string outputPath = GetAnnotatedOutputPath(imagePath, outputDirectory);
-                SaveBitmap(result, outputPath);
-                Clipboard.SetImage((Bitmap)result.Clone());
-            }
-            Close();
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(ex.Message, "图片标注", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-    }
-
-    private static void SaveBitmap(Bitmap bitmap, string path)
-    {
-        string ext = Path.GetExtension(path).ToLowerInvariant();
-        ImageFormat format = ImageFormat.Png;
-        if (ext == ".jpg" || ext == ".jpeg")
-        {
-            format = ImageFormat.Jpeg;
-        }
-        else if (ext == ".bmp")
-        {
-            format = ImageFormat.Bmp;
-        }
-
-        string tempPath = path + ".tmp";
-        bitmap.Save(tempPath, format);
-        File.Move(tempPath, path);
-    }
-
-    private static string GetAnnotatedOutputPath(string path, string outputDirectory)
-    {
-        string dir = outputDirectory;
-        if (string.IsNullOrEmpty(dir))
-        {
-            dir = Path.GetDirectoryName(path);
-        }
-        if (string.IsNullOrEmpty(dir))
-        {
-            dir = Environment.CurrentDirectory;
-        }
-        Directory.CreateDirectory(dir);
-
-        string name = Path.GetFileNameWithoutExtension(path);
-        string ext = Path.GetExtension(path);
-        if (string.IsNullOrEmpty(ext))
-        {
-            ext = ".png";
-        }
-
-        string candidate = Path.Combine(dir, name + "_标注" + ext);
-        int index = 2;
-        while (File.Exists(candidate))
-        {
-            candidate = Path.Combine(dir, name + "_标注_" + index + ext);
-            index++;
-        }
-        return candidate;
-    }
-}
+using System.Text;
 
 internal static class Program
 {
     private const string OutputDirectoryEnvironmentVariable = "QUICKER_ANNOTATOR_OUTPUT_DIR";
+    private const string RenderProfileEnvironmentVariable = "QUICKER_ANNOTATOR_RENDER_PROFILE";
+    private const string RenderProfileLogEnvironmentVariable = "QUICKER_ANNOTATOR_RENDER_PROFILE_LOG";
 
     [STAThread]
     private static int Main(string[] args)
     {
+        bool selfTest = args.Length > 0 && string.Equals(args[0], "-SelfTest", StringComparison.OrdinalIgnoreCase);
+        bool benchmark = IsBenchmarkRequested(args);
         try
         {
-            if (args.Length > 0 && string.Equals(args[0], "-SelfTest", StringComparison.OrdinalIgnoreCase))
+            Win32Api.CoInitializeEx(IntPtr.Zero, 2);
+            Win32Api.SetProcessDPIAware();
+            if (selfTest)
             {
                 RunSelfTest();
                 return 0;
             }
-
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
+            ConfigureRenderPerformanceProbe(args);
+            if (benchmark)
+            {
+                RunBenchmark(args);
+                return 0;
+            }
 
             string outputDirectory = GetConfiguredOutputDirectory(args);
             string[] inputArgs = GetInputArgs(args);
-            string path = CaptureService.GetInputImagePath(inputArgs);
-            using (Bitmap image = CaptureService.LoadBitmap(path))
-            using (var form = new AnnotatorForm(path, (Bitmap)image.Clone(), outputDirectory))
+            string inputPath = GetInputImagePath(inputArgs);
+            using (WicImageDocument image = WicImageDocument.Load(inputPath))
+            using (GpuAnnotatorWindow window = new GpuAnnotatorWindow(inputPath, image, outputDirectory))
             {
-                AppLog.Info("Starting annotator window.");
-                Application.Run(form);
+                return window.Run();
             }
-            return 0;
         }
         catch (Exception ex)
         {
             AppLog.Error("Application failed.", ex);
-            MessageBox.Show(ex.Message, "图片标注", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (selfTest || benchmark)
+            {
+                WriteFailure(ex);
+                return 1;
+            }
+            Win32Api.MessageBoxUnicode(IntPtr.Zero, ex.Message, UiText.AppName, Win32Api.MbOk | Win32Api.MbIconError);
             return 1;
         }
+        finally
+        {
+            RenderPerformanceProbe.FlushSummary("shutdown");
+            Win32Api.CoUninitialize();
+        }
+    }
+
+    private static string GetInputImagePath(string[] args)
+    {
+        if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+        {
+            string path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(args[0].Trim('"')));
+            if (!File.Exists(path))
+            {
+                throw new FileNotFoundException("Image file does not exist.", path);
+            }
+            return path;
+        }
+
+        string clipboardFile = ClipboardBridge.TryGetClipboardImagePath();
+        if (!string.IsNullOrEmpty(clipboardFile))
+        {
+            return clipboardFile;
+        }
+
+        throw new InvalidOperationException("No image found. Copy an image file first, or pass an image path as the first argument.");
     }
 
     private static string GetConfiguredOutputDirectory(string[] args)
@@ -1705,262 +91,779 @@ internal static class Program
         for (int i = 0; i < args.Length; i++)
         {
             string arg = args[i];
-            string inlineValue;
-            if (TryGetInlineOutputDirectory(arg, out inlineValue))
+            string value;
+            if (TryGetInlineOption(arg, "--output-dir", out value))
             {
-                outputDirectory = inlineValue;
+                outputDirectory = value;
             }
-            else if (IsOutputDirectoryOption(arg))
+            else if (IsOption(arg, "--output-dir"))
             {
                 if (i + 1 >= args.Length)
                 {
                     throw new ArgumentException("--output-dir requires a directory path.");
                 }
-
                 outputDirectory = args[++i];
+            }
+            else if (IsOption(arg, "--render-profile-log"))
+            {
+                i++;
+            }
+            else if (IsOption(arg, "--render-benchmark-log"))
+            {
+                i++;
+            }
+            else if (IsOption(arg, "--render-benchmark-frames"))
+            {
+                i++;
             }
         }
 
-        return NormalizeOutputDirectory(outputDirectory);
+        return AppSettingsStore.NormalizeDirectory(outputDirectory);
     }
 
     private static string[] GetInputArgs(string[] args)
     {
-        var inputArgs = new List<string>();
+        List<string> input = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
-            string arg = args[i];
-            string ignoredValue;
-            if (TryGetInlineOutputDirectory(arg, out ignoredValue))
+            string value;
+            if (TryGetInlineOption(args[i], "--output-dir", out value) ||
+                TryGetInlineOption(args[i], "--render-profile", out value) ||
+                TryGetInlineOption(args[i], "--render-profile-log", out value) ||
+                TryGetInlineOption(args[i], "--render-benchmark-log", out value) ||
+                TryGetInlineOption(args[i], "--render-benchmark-frames", out value))
             {
                 continue;
             }
-            if (IsOutputDirectoryOption(arg))
+            if (IsOption(args[i], "--output-dir") ||
+                IsOption(args[i], "--render-profile-log") ||
+                IsOption(args[i], "--render-benchmark-log") ||
+                IsOption(args[i], "--render-benchmark-frames"))
             {
                 i++;
                 continue;
             }
-
-            inputArgs.Add(arg);
+            if (IsOption(args[i], "--render-profile") || IsOption(args[i], "--render-benchmark"))
+            {
+                continue;
+            }
+            input.Add(args[i]);
         }
-
-        return inputArgs.ToArray();
+        return input.ToArray();
     }
 
-    private static bool TryGetInlineOutputDirectory(string arg, out string outputDirectory)
+    private static void ConfigureRenderPerformanceProbe(string[] args)
     {
-        outputDirectory = null;
-        string[] prefixes = new string[]
+        bool enabled = IsTruthy(Environment.GetEnvironmentVariable(RenderProfileEnvironmentVariable));
+        string logPath = Environment.GetEnvironmentVariable(RenderProfileLogEnvironmentVariable);
+        for (int i = 0; i < args.Length; i++)
         {
-            "--output-dir=",
-            "--output-dir:",
-            "-output-dir=",
-            "-output-dir:",
-            "/output-dir=",
-            "/output-dir:"
-        };
-
-        for (int i = 0; i < prefixes.Length; i++)
-        {
-            string prefix = prefixes[i];
-            if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            string value;
+            if (IsOption(args[i], "--render-profile"))
             {
-                outputDirectory = arg.Substring(prefix.Length);
+                enabled = true;
+            }
+            else if (TryGetInlineOption(args[i], "--render-profile", out value))
+            {
+                enabled = IsTruthy(value);
+            }
+            else if (TryGetInlineOption(args[i], "--render-profile-log", out value))
+            {
+                logPath = value;
+            }
+            else if (IsOption(args[i], "--render-profile-log") && i + 1 < args.Length)
+            {
+                logPath = args[++i];
+            }
+        }
+        RenderPerformanceProbe.Configure(enabled, logPath);
+    }
+
+    private static bool IsBenchmarkRequested(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (IsOption(args[i], "--render-benchmark"))
+            {
                 return true;
             }
         }
-
         return false;
     }
 
-    private static bool IsOutputDirectoryOption(string arg)
+    private static void RunBenchmark(string[] args)
     {
-        return string.Equals(arg, "--output-dir", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(arg, "-output-dir", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(arg, "/output-dir", StringComparison.OrdinalIgnoreCase);
+        int frames = 60;
+        string logPath = Path.Combine(Path.GetTempPath(), "QuickerImageAnnotator-render-benchmark.md");
+        for (int i = 0; i < args.Length; i++)
+        {
+            string value;
+            if (TryGetInlineOption(args[i], "--render-benchmark-frames", out value))
+            {
+                int.TryParse(value, out frames);
+            }
+            else if (IsOption(args[i], "--render-benchmark-frames") && i + 1 < args.Length)
+            {
+                int.TryParse(args[++i], out frames);
+            }
+            else if (TryGetInlineOption(args[i], "--render-benchmark-log", out value))
+            {
+                logPath = value;
+            }
+            else if (IsOption(args[i], "--render-benchmark-log") && i + 1 < args.Length)
+            {
+                logPath = args[++i];
+            }
+        }
+        frames = Math.Max(1, frames);
+
+        BenchmarkCase[] cases = new BenchmarkCase[]
+        {
+            new BenchmarkCase("1080p", 1920, 1080, 1280, 720),
+            new BenchmarkCase("4k", 3840, 2160, 1600, 900),
+            new BenchmarkCase("8k", 7680, 4320, 1600, 900),
+            new BenchmarkCase("long-shot", 1440, 6400, 900, 1400)
+        };
+
+        StringBuilder report = new StringBuilder();
+        report.AppendLine("# Render Benchmark");
+        report.AppendLine();
+        report.AppendLine("| case | image | canvas | actual_backend | hardware_accelerated | avg_ms | p50_ms | p95_ms | max_ms |");
+        report.AppendLine("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |");
+        for (int i = 0; i < cases.Length; i++)
+        {
+            BenchmarkResult result = RunBenchmarkCase(cases[i], frames);
+            report.Append("| ").Append(cases[i].Name)
+                .Append(" | ").Append(cases[i].Width).Append("x").Append(cases[i].Height)
+                .Append(" | ").Append(cases[i].CanvasWidth).Append("x").Append(cases[i].CanvasHeight)
+                .Append(" | GpuRenderer | yes | ")
+                .Append(result.Avg.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
+                .Append(result.P50.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
+                .Append(result.P95.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
+                .Append(result.Max.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).AppendLine(" |");
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(logPath)));
+        File.WriteAllText(logPath, report.ToString(), new UTF8Encoding(false));
     }
 
-    private static string NormalizeOutputDirectory(string outputDirectory)
+    private static BenchmarkResult RunBenchmarkCase(BenchmarkCase benchmarkCase, int frames)
     {
-        return AppSettingsStore.NormalizeDirectory(outputDirectory);
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(benchmarkCase.Width, benchmarkCase.Height))
+        {
+            List<AnnotationItem> annotations = CreateBenchmarkAnnotations(benchmarkCase.Width, benchmarkCase.Height);
+            double[] samples = new double[frames];
+            GpuAnnotatorWindow.EnsureWindowClass();
+            IntPtr hwnd = Win32Api.CreateWindowEx(
+                0,
+                GpuAnnotatorWindow.RegisteredClassName,
+                "benchmark",
+                Win32Api.WsOverlappedWindow,
+                0,
+                0,
+                benchmarkCase.CanvasWidth,
+                benchmarkCase.CanvasHeight,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                Win32Api.GetModuleHandle(null),
+                IntPtr.Zero);
+            if (hwnd == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("Benchmark window creation failed.");
+            }
+            IntPtr hdc = IntPtr.Zero;
+            try
+            {
+                hdc = Win32Api.GetDC(hwnd);
+                using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
+                {
+                    GpuRect view = GetBenchmarkView(benchmarkCase);
+                    for (int i = 0; i < frames; i++)
+                    {
+                        Stopwatch sw = Stopwatch.StartNew();
+                        renderer.RenderToHdc(hdc, benchmarkCase.CanvasWidth, benchmarkCase.CanvasHeight, view, annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+                        sw.Stop();
+                        samples[i] = sw.Elapsed.TotalMilliseconds;
+                    }
+                }
+            }
+            finally
+            {
+                if (hdc != IntPtr.Zero)
+                {
+                    Win32Api.ReleaseDC(hwnd, hdc);
+                }
+                Win32Api.DestroyWindow(hwnd);
+            }
+            Array.Sort(samples);
+            double sum = 0;
+            for (int i = 0; i < samples.Length; i++)
+            {
+                sum += samples[i];
+            }
+            BenchmarkResult result = new BenchmarkResult();
+            result.Avg = sum / samples.Length;
+            result.P50 = samples[Math.Min(samples.Length - 1, (int)Math.Floor(samples.Length * 0.50))];
+            result.P95 = samples[Math.Min(samples.Length - 1, (int)Math.Floor(samples.Length * 0.95))];
+            result.Max = samples[samples.Length - 1];
+            return result;
+        }
+    }
+
+    private static List<AnnotationItem> CreateBenchmarkAnnotations(int width, int height)
+    {
+        List<AnnotationItem> items = new List<AnnotationItem>();
+        items.Add(new AnnotationItem { Tool = ToolMode.Rect, Start = new GpuPoint(width * 0.08f, height * 0.08f), End = new GpuPoint(width * 0.42f, height * 0.30f), Stroke = AppStyles.Palette[0], StrokeWidth = 8f });
+        items.Add(new AnnotationItem { Tool = ToolMode.Ellipse, Start = new GpuPoint(width * 0.52f, height * 0.10f), End = new GpuPoint(width * 0.86f, height * 0.34f), Stroke = AppStyles.Palette[1], StrokeWidth = 8f });
+        items.Add(new AnnotationItem { Tool = ToolMode.Arrow, Start = new GpuPoint(width * 0.18f, height * 0.72f), End = new GpuPoint(width * 0.78f, height * 0.44f), Stroke = AppStyles.Palette[2], StrokeWidth = 10f });
+        AnnotationItem pen = new AnnotationItem { Tool = ToolMode.Pen, Stroke = AppStyles.Palette[4], StrokeWidth = 7f };
+        for (int i = 0; i < 140; i++)
+        {
+            float t = i / 139f;
+            pen.AddPoint(new GpuPoint(width * (0.08f + 0.84f * t), height * (0.56f + 0.08f * (float)Math.Sin(t * Math.PI * 8))));
+        }
+        items.Add(pen);
+        items.Add(new AnnotationItem { Tool = ToolMode.Text, Start = new GpuPoint(width * 0.12f, height * 0.38f), Stroke = AppStyles.Palette[3], StrokeWidth = 7f, Text = "GPU" });
+        items.Add(new AnnotationItem { Tool = ToolMode.Mosaic, Start = new GpuPoint(width * 0.58f, height * 0.58f), End = new GpuPoint(width * 0.88f, height * 0.86f), Stroke = AppStyles.Palette[0], StrokeWidth = 5f });
+        return items;
+    }
+
+    private static GpuRect GetBenchmarkView(BenchmarkCase benchmarkCase)
+    {
+        float scale = Math.Min(
+            benchmarkCase.CanvasWidth / (float)benchmarkCase.Width,
+            benchmarkCase.CanvasHeight / (float)benchmarkCase.Height);
+        float width = benchmarkCase.Width * scale;
+        float height = benchmarkCase.Height * scale;
+        return new GpuRect(
+            (benchmarkCase.CanvasWidth - width) / 2f,
+            (benchmarkCase.CanvasHeight - height) / 2f,
+            width,
+            height);
     }
 
     private static void RunSelfTest()
     {
-        AssertGraphicsTransformOrder();
-        AssertAnnotationPointReplacementInvalidatesCache();
-        AssertResizeTransform();
-        AssertMosaicLockBitsRendering();
-
-        AssertMeaningful(new AnnotationItem
-        {
-            Tool = ToolMode.Arrow,
-            Start = new PointF(10, 10),
-            End = new PointF(10, 10)
-        }, false);
-
-        AssertMeaningful(new AnnotationItem
-        {
-            Tool = ToolMode.Arrow,
-            Start = new PointF(10, 10),
-            End = new PointF(20, 20)
-        }, true);
-
-        AssertMeaningful(new AnnotationItem
-        {
-            Tool = ToolMode.Rect,
-            Start = new PointF(10, 10),
-            End = new PointF(10.5f, 12)
-        }, false);
-
-        var penItem = new AnnotationItem();
-        penItem.Tool = ToolMode.Pen;
-        penItem.AddPoint(new PointF(10, 10));
-        AssertMeaningful(penItem, false);
-        penItem.AddPoint(new PointF(20, 20));
-        AssertMeaningful(penItem, true);
+        AssertNoForbiddenDependencies();
+        AssertWicRoundTrip();
+        AssertGpuExport();
+        AssertDirectWriteTextLayout();
+        AssertGpuRendererRebuild();
+        AssertGpuWindowChromeRender();
+        AssertGpuInteractionSemantics();
+        AssertClipboardWorkflow();
+        AssertBenchmarkSmoke();
     }
 
-    private static void AssertGraphicsTransformOrder()
+    private static void AssertNoForbiddenDependencies()
     {
-        using (var bitmap = new Bitmap(1, 1))
-        using (Graphics g = Graphics.FromImage(bitmap))
+        string root = AppDomain.CurrentDomain.BaseDirectory;
+        string[] forbidden = new string[]
         {
-            g.TranslateTransform(100f, 50f, MatrixOrder.Prepend);
-            g.ScaleTransform(2f, 2f, MatrixOrder.Prepend);
-            g.TranslateTransform(3f, 4f, MatrixOrder.Prepend);
-
-            PointF[] point = new PointF[] { new PointF(10f, 20f) };
-            using (Matrix transform = g.Transform)
+            "System." + "Drawing",
+            "System.Windows." + "Forms",
+            "Gra" + "phics",
+            "Bit" + "map",
+            "Image" + "Format"
+        };
+        foreach (string file in Directory.GetFiles(root, "*.cs"))
+        {
+            string text = File.ReadAllText(file);
+            for (int i = 0; i < forbidden.Length; i++)
             {
-                transform.TransformPoints(point);
+                if (text.IndexOf(forbidden[i], StringComparison.Ordinal) >= 0)
+                {
+                    throw new InvalidOperationException("Forbidden dependency token '" + forbidden[i] + "' found in " + Path.GetFileName(file));
+                }
+            }
+        }
+        string build = File.ReadAllText(Path.Combine(root, "BuildAndRun.ps1"));
+        if (build.IndexOf("System." + "Drawing", StringComparison.Ordinal) >= 0 ||
+            build.IndexOf("System.Windows." + "Forms", StringComparison.Ordinal) >= 0)
+        {
+            throw new InvalidOperationException("Forbidden build reference found.");
+        }
+    }
+
+    private static void AssertWicRoundTrip()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "quicker-gpu-wic-roundtrip-" + Guid.NewGuid().ToString("N") + ".png");
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(32, 24))
+        {
+            image.Save(path);
+        }
+        using (WicImageDocument loaded = WicImageDocument.Load(path))
+        {
+            if (loaded.Width != 32 || loaded.Height != 24 || loaded.Pixels.Length != 32 * 24 * 4)
+            {
+                throw new InvalidOperationException("WIC roundtrip self test failed.");
+            }
+        }
+    }
+
+    private static void AssertGpuExport()
+    {
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(128, 96))
+        {
+            List<AnnotationItem> items = CreateBenchmarkAnnotations(128, 96);
+            byte[] pixels = GpuRenderer.RenderExport(image, items);
+            if (pixels == null || pixels.Length != 128 * 96 * 4)
+            {
+                throw new InvalidOperationException("GPU export self test produced invalid pixels.");
+            }
+            bool anyAlpha = false;
+            for (int i = 3; i < pixels.Length; i += 4)
+            {
+                if (pixels[i] != 0)
+                {
+                    anyAlpha = true;
+                    break;
+                }
+            }
+            if (!anyAlpha)
+            {
+                throw new InvalidOperationException("GPU export self test produced transparent output.");
+            }
+        }
+    }
+
+    private static void AssertDirectWriteTextLayout()
+    {
+        GpuRect bounds = GpuRenderer.MeasureTextBounds("GPU\u6587\u5b57", 24f);
+        if (bounds.Width <= 20f || bounds.Height <= 10f)
+        {
+            throw new InvalidOperationException("DirectWrite measurement self test failed.");
+        }
+
+        TextHitResult hit = GpuRenderer.HitTestText("GPU\u6587\u5b57", 24f, new GpuPoint(4f, 8f));
+        if (!hit.IsInside || hit.TextPosition < 0)
+        {
+            throw new InvalidOperationException("DirectWrite hit-test self test failed.");
+        }
+    }
+
+    private static void AssertGpuRendererRebuild()
+    {
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(96, 64))
+        {
+            GpuAnnotatorWindow.EnsureWindowClass();
+            IntPtr hwnd = Win32Api.CreateWindowEx(
+                0,
+                GpuAnnotatorWindow.RegisteredClassName,
+                "selftest-rebuild",
+                Win32Api.WsOverlappedWindow,
+                0,
+                0,
+                96,
+                64,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                Win32Api.GetModuleHandle(null),
+                IntPtr.Zero);
+            if (hwnd == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("Renderer rebuild self test cannot create window.");
+            }
+            IntPtr hdc = IntPtr.Zero;
+            try
+            {
+                hdc = Win32Api.GetDC(hwnd);
+                List<AnnotationItem> annotations = CreateBenchmarkAnnotations(96, 64);
+                using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
+                {
+                    renderer.RenderToHdc(hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+                }
+                using (GpuRenderer rebuilt = GpuRenderer.CreateForWindow(image))
+                {
+                    rebuilt.RenderToHdc(hdc, 96, 64, new GpuRect(0, 0, 96, 64), annotations, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+                }
+            }
+            finally
+            {
+                if (hdc != IntPtr.Zero)
+                {
+                    Win32Api.ReleaseDC(hwnd, hdc);
+                }
+                Win32Api.DestroyWindow(hwnd);
+            }
+        }
+    }
+
+    private static void AssertGpuWindowChromeRender()
+    {
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(320, 180))
+        {
+            GpuAnnotatorWindow.EnsureWindowClass();
+            IntPtr hwnd = Win32Api.CreateWindowEx(
+                0,
+                GpuAnnotatorWindow.RegisteredClassName,
+                "selftest-chrome",
+                Win32Api.WsOverlappedWindow,
+                0,
+                0,
+                640,
+                420,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                Win32Api.GetModuleHandle(null),
+                IntPtr.Zero);
+            if (hwnd == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("Window chrome render self test cannot create window.");
             }
 
-            AssertNear(point[0].X, 126f, "GDI+ transform x");
-            AssertNear(point[0].Y, 98f, "GDI+ transform y");
-        }
-    }
-
-    private static void AssertAnnotationPointReplacementInvalidatesCache()
-    {
-        var item = new AnnotationItem();
-        item.Tool = ToolMode.Pen;
-        item.AddPoint(new PointF(1, 1));
-        item.GetDrawingPoints();
-        item.SetPoints(new PointF[] { new PointF(4, 5), new PointF(8, 9) });
-
-        PointF[] points = item.GetDrawingPoints();
-        if (points.Length != 2)
-        {
-            throw new InvalidOperationException("Point replacement self test failed.");
-        }
-        AssertNear(points[0].X, 4f, "point replacement x");
-        AssertNear(points[1].Y, 9f, "point replacement y");
-    }
-
-    private static void AssertResizeTransform()
-    {
-        var item = new AnnotationItem
-        {
-            Tool = ToolMode.Rect,
-            Start = new PointF(10, 10),
-            End = new PointF(30, 30),
-            StrokeColor = AppStyles.DefaultStroke,
-            StrokeWidth = 4f
-        };
-
-        Type formType = typeof(AnnotatorForm);
-        System.Reflection.MethodInfo capture = formType.GetMethod(
-            "CaptureAnnotation",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        System.Reflection.MethodInfo apply = formType.GetMethod(
-            "ApplyResizeToAnnotation",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Type handleType = formType.GetNestedType(
-            "SelectionHandle",
-            System.Reflection.BindingFlags.NonPublic);
-        if (capture == null || apply == null || handleType == null)
-        {
-            throw new InvalidOperationException("Resize transform self test cannot find helpers.");
-        }
-
-        object snapshot = capture.Invoke(null, new object[] { item });
-        object rightHandle = Enum.Parse(handleType, "Right");
-        apply.Invoke(null, new object[]
-        {
-            item,
-            snapshot,
-            new RectangleF(10, 10, 20, 20),
-            rightHandle,
-            new PointF(5, 0)
-        });
-
-        AssertNear(item.Start.X, 10f, "resize transform left");
-        AssertNear(item.End.X, 35f, "resize transform right");
-        AssertNear(item.End.Y, 30f, "resize transform bottom");
-    }
-
-    private static void AssertMosaicLockBitsRendering()
-    {
-        var item = new AnnotationItem
-        {
-            Tool = ToolMode.Mosaic,
-            Start = new PointF(0, 0),
-            End = new PointF(36, 18)
-        };
-
-        using (var bitmap = new Bitmap(36, 18, PixelFormat.Format32bppArgb))
-        {
-            using (Graphics g = Graphics.FromImage(bitmap))
+            IntPtr hdc = IntPtr.Zero;
+            try
             {
-                using (var red = new SolidBrush(Color.Red))
-                using (var green = new SolidBrush(Color.Lime))
+                hdc = Win32Api.GetDC(hwnd);
+                List<AnnotationItem> annotations = CreateBenchmarkAnnotations(320, 180);
+                AnnotationItem preview = new AnnotationItem
                 {
-                    g.FillRectangle(red, 0, 0, 18, 18);
-                    g.FillRectangle(green, 18, 0, 18, 18);
+                    Tool = ToolMode.Rect,
+                    Start = new GpuPoint(18, 18),
+                    End = new GpuPoint(128, 86),
+                    Stroke = AppStyles.Palette[0],
+                    StrokeWidth = 6f
+                };
+                SettingsOverlayState overlay = new SettingsOverlayState();
+                overlay.Tooltip = "\u5f53\u524d\u540e\u7aef: GPU/Direct2D";
+                overlay.TooltipPoint = new GpuPoint(460, 90);
+                using (GpuRenderer renderer = GpuRenderer.CreateForWindow(image))
+                {
+                    GpuRect view = new GpuRect(42, 126, 512, 288);
+                    renderer.RenderToHdc(hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
+                    overlay.Visible = true;
+                    overlay.OutputDirectory = Path.GetTempPath();
+                    renderer.RenderToHdc(hdc, 640, 420, view, annotations, preview, 0, true, ToolMode.Rect, AppStyles.Palette[0], 6f, overlay);
+                }
+            }
+            finally
+            {
+                if (hdc != IntPtr.Zero)
+                {
+                    Win32Api.ReleaseDC(hwnd, hdc);
+                }
+                Win32Api.DestroyWindow(hwnd);
+            }
+        }
+    }
+
+    private static void AssertGpuInteractionSemantics()
+    {
+        AnnotationItem arrow = new AnnotationItem
+        {
+            Tool = ToolMode.Arrow,
+            Start = new GpuPoint(0, 0),
+            End = new GpuPoint(100, 0),
+            Stroke = AppStyles.Palette[0],
+            StrokeWidth = 10f
+        };
+        GpuPoint[] arrowPoints = GpuRenderer.BuildArrow(arrow, 10f);
+        if (arrowPoints.Length != 7 ||
+            Math.Abs(arrowPoints[0].Y + 2.2f) > 0.05f ||
+            Math.Abs(arrowPoints[2].Y + 24f) > 0.05f ||
+            Math.Abs(arrowPoints[3].X - 100f) > 0.05f)
+        {
+            throw new InvalidOperationException("GPU arrow geometry self test failed.");
+        }
+
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(80, 60))
+        {
+            GpuAnnotatorWindow window = new GpuAnnotatorWindow("selftest.png", image, null);
+            Type type = typeof(GpuAnnotatorWindow);
+            System.Reflection.BindingFlags instanceFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            System.Reflection.BindingFlags staticFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+            System.Reflection.MethodInfo add = type.GetMethod("AddAnnotation", instanceFlags);
+            System.Reflection.MethodInfo delete = type.GetMethod("DeleteSelectedAnnotation", instanceFlags);
+            System.Reflection.MethodInfo undo = type.GetMethod("UndoAnnotationAction", instanceFlags);
+            System.Reflection.MethodInfo capture = type.GetMethod("CaptureAnnotation", staticFlags);
+            System.Reflection.MethodInfo record = type.GetMethod("RecordTransformUndo", instanceFlags);
+            System.Reflection.MethodInfo cursorForHandle = type.GetMethod("GetCursorForSelectionHandle", staticFlags);
+            System.Reflection.MethodInfo applyResize = type.GetMethod("ApplyResizeToAnnotation", staticFlags);
+            System.Reflection.MethodInfo beginText = type.GetMethod("BeginInlineTextEdit", instanceFlags);
+            System.Reflection.MethodInfo beginExistingText = type.GetMethod("BeginExistingTextEdit", instanceFlags);
+            System.Reflection.MethodInfo replaceText = type.GetMethod("ReplaceInlineSelection", instanceFlags);
+            System.Reflection.MethodInfo moveCaret = type.GetMethod("MoveInlineCaret", instanceFlags);
+            System.Reflection.MethodInfo selectAllText = type.GetMethod("SelectAllInlineText", instanceFlags);
+            System.Reflection.MethodInfo deleteText = type.GetMethod("DeleteInlineText", instanceFlags);
+            System.Reflection.MethodInfo commitText = type.GetMethod("CommitTextIfNeeded", instanceFlags);
+            System.Reflection.MethodInfo applyStyle = type.GetMethod("ApplyActiveStyle", instanceFlags);
+            System.Reflection.FieldInfo itemsField = type.GetField("items", instanceFlags);
+            System.Reflection.FieldInfo inlineTextField = type.GetField("inlineText", instanceFlags);
+            System.Reflection.FieldInfo inlineCaretField = type.GetField("inlineCaretIndex", instanceFlags);
+            if (add == null || delete == null || undo == null || capture == null || record == null ||
+                cursorForHandle == null || applyResize == null || beginText == null || beginExistingText == null || replaceText == null || moveCaret == null ||
+                selectAllText == null || deleteText == null || commitText == null || applyStyle == null ||
+                itemsField == null || inlineTextField == null || inlineCaretField == null)
+            {
+                throw new InvalidOperationException("GPU interaction self test cannot find helpers.");
+            }
+
+            if ((int)cursorForHandle.Invoke(null, new object[] { SelectionHandle.TopLeft }) != Win32Api.IdcSizeNwSe ||
+                (int)cursorForHandle.Invoke(null, new object[] { SelectionHandle.TopRight }) != Win32Api.IdcSizeNeSw ||
+                (int)cursorForHandle.Invoke(null, new object[] { SelectionHandle.Top }) != Win32Api.IdcSizeNs ||
+                (int)cursorForHandle.Invoke(null, new object[] { SelectionHandle.Left }) != Win32Api.IdcSizeWe)
+            {
+                throw new InvalidOperationException("GPU resize cursor self test failed.");
+            }
+
+            AnnotationItem resizeArrow = new AnnotationItem
+            {
+                Tool = ToolMode.Arrow,
+                Start = new GpuPoint(2, 3),
+                End = new GpuPoint(30, 40),
+                Stroke = AppStyles.Palette[0],
+                StrokeWidth = 5f
+            };
+            object resizeArrowBefore = capture.Invoke(null, new object[] { resizeArrow });
+            applyResize.Invoke(null, new object[] { resizeArrow, resizeArrowBefore, GpuRect.Normalize(resizeArrow.Start, resizeArrow.End), SelectionHandle.ArrowEnd, new GpuPoint(7, -6) });
+            if (Math.Abs(resizeArrow.Start.X - 2f) > 0.01f || Math.Abs(resizeArrow.Start.Y - 3f) > 0.01f ||
+                Math.Abs(resizeArrow.End.X - 37f) > 0.01f || Math.Abs(resizeArrow.End.Y - 34f) > 0.01f)
+            {
+                throw new InvalidOperationException("GPU arrow end handle resize self test failed.");
+            }
+            applyResize.Invoke(null, new object[] { resizeArrow, resizeArrowBefore, GpuRect.Normalize(resizeArrow.Start, resizeArrow.End), SelectionHandle.ArrowStart, new GpuPoint(-4, 8) });
+            if (Math.Abs(resizeArrow.Start.X + 2f) > 0.01f || Math.Abs(resizeArrow.Start.Y - 11f) > 0.01f ||
+                Math.Abs(resizeArrow.End.X - 30f) > 0.01f || Math.Abs(resizeArrow.End.Y - 40f) > 0.01f)
+            {
+                throw new InvalidOperationException("GPU arrow start handle resize self test failed.");
+            }
+
+            AnnotationItem rect = new AnnotationItem
+            {
+                Tool = ToolMode.Rect,
+                Start = new GpuPoint(10, 10),
+                End = new GpuPoint(30, 30),
+                Stroke = AppStyles.Palette[0],
+                StrokeWidth = 5f
+            };
+            add.Invoke(window, new object[] { rect });
+            List<AnnotationItem> items = (List<AnnotationItem>)itemsField.GetValue(window);
+            if (items.Count != 1)
+            {
+                throw new InvalidOperationException("GPU add selection self test failed.");
+            }
+
+            object before = capture.Invoke(null, new object[] { rect });
+            rect.Translate(5f, 7f);
+            object after = capture.Invoke(null, new object[] { rect });
+            record.Invoke(window, new object[] { rect, 0, before, after });
+            undo.Invoke(window, null);
+            if (Math.Abs(rect.Start.X - 10f) > 0.01f || Math.Abs(rect.Start.Y - 10f) > 0.01f)
+            {
+                throw new InvalidOperationException("GPU transform undo self test failed.");
+            }
+
+            bool deleted = (bool)delete.Invoke(window, null);
+            if (!deleted || items.Count != 0)
+            {
+                throw new InvalidOperationException("GPU delete self test failed.");
+            }
+            undo.Invoke(window, null);
+            if (items.Count != 1)
+            {
+                throw new InvalidOperationException("GPU delete undo self test failed.");
+            }
+            undo.Invoke(window, null);
+            if (items.Count != 0)
+            {
+                throw new InvalidOperationException("GPU add undo self test failed.");
+            }
+
+            beginText.Invoke(window, new object[] { new GpuPoint(4, 4) });
+            replaceText.Invoke(window, new object[] { "abc" });
+            moveCaret.Invoke(window, new object[] { 1, false });
+            replaceText.Invoke(window, new object[] { "X" });
+            if ((string)inlineTextField.GetValue(window) != "aXbc" || (int)inlineCaretField.GetValue(window) != 2)
+            {
+                throw new InvalidOperationException("GPU text caret insert self test failed.");
+            }
+            selectAllText.Invoke(window, null);
+            replaceText.Invoke(window, new object[] { "\u6587" });
+            if ((string)inlineTextField.GetValue(window) != "\u6587")
+            {
+                throw new InvalidOperationException("GPU text selection replace self test failed.");
+            }
+            selectAllText.Invoke(window, null);
+            deleteText.Invoke(window, null);
+            if (!string.IsNullOrEmpty((string)inlineTextField.GetValue(window)))
+            {
+                throw new InvalidOperationException("GPU text selection delete self test failed.");
+            }
+            commitText.Invoke(window, null);
+
+            AnnotationItem styled = new AnnotationItem
+            {
+                Tool = ToolMode.Rect,
+                Start = new GpuPoint(8, 8),
+                End = new GpuPoint(28, 28),
+                Stroke = AppStyles.Palette[0],
+                StrokeWidth = 4f
+            };
+            add.Invoke(window, new object[] { styled });
+            applyStyle.Invoke(window, new object[] { AppStyles.Palette[1], 9f, true, true });
+            if (styled.Stroke.Packed != AppStyles.Palette[1].Packed || Math.Abs(styled.StrokeWidth - 9f) > 0.01f)
+            {
+                throw new InvalidOperationException("GPU selected annotation style self test failed.");
+            }
+            undo.Invoke(window, null);
+            if (styled.Stroke.Packed != AppStyles.Palette[0].Packed || Math.Abs(styled.StrokeWidth - 4f) > 0.01f)
+            {
+                throw new InvalidOperationException("GPU selected annotation style undo self test failed.");
+            }
+
+            AnnotationItem textItem = new AnnotationItem
+            {
+                Tool = ToolMode.Text,
+                Start = new GpuPoint(6, 6),
+                Stroke = AppStyles.Palette[0],
+                StrokeWidth = 4f,
+                Text = "hello"
+            };
+            add.Invoke(window, new object[] { textItem });
+            int textIndex = items.IndexOf(textItem);
+            beginExistingText.Invoke(window, new object[] { textIndex, new GpuPoint(8, 8) });
+            selectAllText.Invoke(window, null);
+            replaceText.Invoke(window, new object[] { "hi" });
+            commitText.Invoke(window, null);
+            if (textItem.Text != "hi")
+            {
+                throw new InvalidOperationException("GPU existing text edit self test failed.");
+            }
+            undo.Invoke(window, null);
+            if (textItem.Text != "hello")
+            {
+                throw new InvalidOperationException("GPU existing text edit undo self test failed.");
+            }
+        }
+    }
+
+    private static void AssertClipboardWorkflow()
+    {
+        using (WicImageDocument image = WicImageDocument.CreateSynthetic(24, 16))
+        {
+            string pngPath = Path.Combine(Path.GetTempPath(), "quicker-gpu-clipboard-" + Guid.NewGuid().ToString("N") + ".png");
+            image.Save(pngPath);
+            byte[] pngBytes = File.ReadAllBytes(pngPath);
+
+            ClipboardBridge.SetPngBytesForSelfTest(pngBytes);
+            string fromPng = ClipboardBridge.TryGetClipboardImagePath();
+            using (WicImageDocument loaded = WicImageDocument.Load(fromPng))
+            {
+                if (loaded.Width != 24 || loaded.Height != 16)
+                {
+                    throw new InvalidOperationException("PNG clipboard self test failed.");
                 }
             }
 
-            var method = typeof(AnnotatorForm).GetMethod(
-                "ApplyMosaic",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-            if (method == null)
+            ClipboardBridge.SetDibForSelfTest(image.Width, image.Height, image.Pixels);
+            string fromDib = ClipboardBridge.TryGetClipboardImagePath();
+            using (WicImageDocument loaded = WicImageDocument.Load(fromDib))
             {
-                throw new InvalidOperationException("Mosaic self test cannot find helper.");
+                if (loaded.Width != 24 || loaded.Height != 16)
+                {
+                    throw new InvalidOperationException("DIB clipboard self test failed.");
+                }
             }
 
-            method.Invoke(null, new object[] { bitmap, item });
-            Color left = bitmap.GetPixel(4, 4);
-            Color right = bitmap.GetPixel(22, 4);
-            if (left.R <= left.G || left.R <= left.B || right.G <= right.R || right.G <= right.B)
+            ClipboardBridge.SetImage(IntPtr.Zero, pngPath, image.Width, image.Height, image.Pixels);
+            string fromFileDrop = ClipboardBridge.TryGetClipboardImagePath();
+            using (WicImageDocument loaded = WicImageDocument.Load(fromFileDrop))
             {
-                throw new InvalidOperationException("Mosaic lockbits self test failed.");
+                if (loaded.Width != 24 || loaded.Height != 16)
+                {
+                    throw new InvalidOperationException("clipboard output self test failed.");
+                }
             }
         }
     }
 
-    private static void AssertNear(float actual, float expected, string label)
+    private static void AssertBenchmarkSmoke()
     {
-        if (Math.Abs(actual - expected) > 0.001f)
+        BenchmarkResult result = RunBenchmarkCase(new BenchmarkCase("smoke", 96, 64, 96, 64), 1);
+        if (result.Max <= 0)
         {
-            throw new InvalidOperationException(label + " self test failed.");
+            throw new InvalidOperationException("Benchmark smoke self test failed.");
         }
     }
 
-    private static void AssertMeaningful(AnnotationItem item, bool expected)
+    private static bool TryGetInlineOption(string arg, string option, out string value)
     {
-        var method = typeof(AnnotatorForm).GetMethod(
-            "IsMeaningfulAnnotation",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        if (method == null)
+        value = null;
+        string[] prefixes = new string[]
         {
-            throw new InvalidOperationException("Self test cannot find annotation filter.");
+            option + "=",
+            option + ":",
+            "-" + option.TrimStart('-') + "=",
+            "-" + option.TrimStart('-') + ":",
+            "/" + option.TrimStart('-') + "=",
+            "/" + option.TrimStart('-') + ":"
+        };
+        for (int i = 0; i < prefixes.Length; i++)
+        {
+            if (arg.StartsWith(prefixes[i], StringComparison.OrdinalIgnoreCase))
+            {
+                value = arg.Substring(prefixes[i].Length);
+                return true;
+            }
         }
+        return false;
+    }
 
-        bool actual = (bool)method.Invoke(null, new object[] { item });
-        if (actual != expected)
+    private static bool IsOption(string arg, string option)
+    {
+        string trimmed = option.TrimStart('-');
+        return string.Equals(arg, option, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "-" + trimmed, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "/" + trimmed, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTruthy(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
         {
-            throw new InvalidOperationException("Annotation filter self test failed.");
+            return false;
         }
+        value = value.Trim();
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void WriteFailure(Exception exception)
+    {
+        try
+        {
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "QuickerImageAnnotator-selftest-error.log"), exception.ToString());
+        }
+        catch
+        {
+        }
+    }
+
+    private struct BenchmarkCase
+    {
+        public readonly string Name;
+        public readonly int Width;
+        public readonly int Height;
+        public readonly int CanvasWidth;
+        public readonly int CanvasHeight;
+
+        public BenchmarkCase(string name, int width, int height, int canvasWidth, int canvasHeight)
+        {
+            Name = name;
+            Width = width;
+            Height = height;
+            CanvasWidth = canvasWidth;
+            CanvasHeight = canvasHeight;
+        }
+    }
+
+    private struct BenchmarkResult
+    {
+        public double Avg;
+        public double P50;
+        public double P95;
+        public double Max;
     }
 }

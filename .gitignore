@@ -1,5 +1,7 @@
 # Build outputs
 *.exe
+!AnnotatorApp.exe
+!AnnotatorApp-x64.exe
 *.pdb
 *.obj
 

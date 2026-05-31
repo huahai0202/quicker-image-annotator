@@ -55,9 +55,9 @@ if ($needsBuild) {
         "/platform:$platformName",
         "/unsafe+",
         "/optimize+",
+        "/codepage:65001",
         "/out:$exe",
-        "/r:System.Windows.Forms.dll",
-        "/r:System.Drawing.dll"
+        "/r:System.dll"
     )
     if (Test-Path -LiteralPath $icon) {
         $compileArgs += "/win32icon:$icon"
