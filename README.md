@@ -25,6 +25,9 @@ Quicker Image Annotator 是一个轻量的 Windows 图片标注工具。它面�
 
 - `AnnotatorApp.exe`：默认 AnyCPU 构建。
 - `AnnotatorApp-x64.exe`：显式 x64 构建。
+- `AnnotatorApp-x86.exe`：显式 x86 构建。
+
+源码仓库不提交可执行产物；exe 只通过 Release 资产分发。
 
 ## 使用方式
 
@@ -93,6 +96,12 @@ x64 自检：
 powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x64 -SelfTest
 ```
 
+x86 自检：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x86 -SelfTest
+```
+
 性能基准：
 
 ```powershell
@@ -115,5 +124,8 @@ powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x64 -SelfTe
 
 - `AnnotatorApp.exe`
 - `AnnotatorApp-x64.exe`
+- `AnnotatorApp-x86.exe`
+
+这些文件应作为 GitHub Release 资产上传，不提交到源码树。
 
 更多设计和历史记录放在 [docs/superpowers/specs](docs/superpowers/specs)。
