@@ -45,11 +45,9 @@ internal static class Win32Api
 {
     public const int CwUseDefault = unchecked((int)0x80000000);
     public const int SwShow = 5;
-    public const int IdOk = 1;
     public const int WmDestroy = 0x0002;
     public const int WmPaint = 0x000F;
     public const int WmClose = 0x0010;
-    public const int WmQuit = 0x0012;
     public const int WmTimer = 0x0113;
     public const int WmEraseBkgnd = 0x0014;
     public const int WmSetCursor = 0x0020;
@@ -68,12 +66,9 @@ internal static class Win32Api
     public const int GcsResultStr = 0x0800;
     public const int CfsPoint = 0x0002;
     public const int WsOverlappedWindow = 0x00CF0000;
-    public const int WsVisible = 0x10000000;
     public const int CsHRedraw = 0x0002;
     public const int CsVRedraw = 0x0001;
     public const int CsDblClks = 0x0008;
-    public const int ColorWindow = 5;
-    public const int MkControl = 0x0008;
     public const int VkEscape = 0x1B;
     public const int VkDelete = 0x2E;
     public const int VkBack = 0x08;
@@ -90,8 +85,6 @@ internal static class Win32Api
     public const int VkX = 0x58;
     public const int VkZ = 0x5A;
     public const int VkS = 0x53;
-    public const int VkOemPlus = 0xBB;
-    public const int VkOemMinus = 0xBD;
     public const int GwlpUserData = -21;
     public const int IdcArrow = 32512;
     public const int IdcIBeam = 32513;
@@ -283,13 +276,7 @@ internal static class Win32Api
     public static extern bool ScreenToClient(IntPtr hWnd, ref NativePoint lpPoint);
 
     [DllImport("user32.dll")]
-    public static extern bool ClientToScreen(IntPtr hWnd, ref NativePoint lpPoint);
-
-    [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out NativePoint lpPoint);
-
-    [DllImport("user32.dll", EntryPoint = "SetWindowTextW", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    public static extern bool SetWindowText(IntPtr hWnd, [MarshalAs(UnmanagedType.LPWStr)] string lpString);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowTextW", ExactSpelling = true)]
     private static extern bool SetWindowTextPtr(IntPtr hWnd, IntPtr lpString);
@@ -308,9 +295,6 @@ internal static class Win32Api
 
     [DllImport("user32.dll")]
     public static extern bool KillTimer(IntPtr hWnd, IntPtr uIDEvent);
-
-    [DllImport("user32.dll", EntryPoint = "MessageBoxW", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    public static extern int MessageBox(IntPtr hWnd, [MarshalAs(UnmanagedType.LPWStr)] string lpText, [MarshalAs(UnmanagedType.LPWStr)] string lpCaption, uint uType);
 
     [DllImport("user32.dll", EntryPoint = "MessageBoxW", ExactSpelling = true)]
     private static extern int MessageBoxPtr(IntPtr hWnd, IntPtr lpText, IntPtr lpCaption, uint uType);
@@ -335,12 +319,6 @@ internal static class Win32Api
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
     private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
-
-    [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
-    private static extern IntPtr GetWindowLong32(IntPtr hWnd, int nIndex);
-
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
-    private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
 
     [DllImport("kernel32.dll")]
     public static extern IntPtr GetModuleHandle([MarshalAs(UnmanagedType.LPWStr)] string lpModuleName);
@@ -422,11 +400,6 @@ internal static class Win32Api
     public static IntPtr SetUserData(IntPtr hwnd, IntPtr value)
     {
         return IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, GwlpUserData, value) : SetWindowLong32(hwnd, GwlpUserData, value);
-    }
-
-    public static IntPtr GetUserData(IntPtr hwnd)
-    {
-        return IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, GwlpUserData) : GetWindowLong32(hwnd, GwlpUserData);
     }
 
     public static bool SetWindowTextUnicode(IntPtr hwnd, string text)
@@ -998,14 +971,6 @@ internal static class D2DApi
         D2Rgba c = D2Rgba.FromRgba(rgba);
         ClearDelegate clear = ComUtil.GetDelegate<ClearDelegate>(target, 47);
         clear(target, ref c);
-    }
-
-    public static void DrawImage(IntPtr target, IntPtr image, GpuRect destination, int interpolation)
-    {
-        RectF dest = RectF.FromRect(destination);
-        RectF source = new RectF(0f, 0f, destination.Width <= 0f ? 1f : 1000000f, destination.Height <= 0f ? 1f : 1000000f);
-        DrawImageDelegate draw = ComUtil.GetDelegate<DrawImageDelegate>(target, 26);
-        draw(target, image, ref dest, 1f, interpolation, ref source);
     }
 
     public static void DrawImageSection(IntPtr target, IntPtr image, GpuRect destination, GpuRect sourceRect, int interpolation)

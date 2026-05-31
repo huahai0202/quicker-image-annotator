@@ -7,15 +7,8 @@ using System.Text;
 
 internal static class RenderPerformanceProbe
 {
-    public const string CanvasPaint = "CanvasPaint";
-    public const string DisplayCacheRebuild = "DisplayCacheRebuild";
-    public const string MoveBackgroundCacheRebuild = "MoveBackgroundCacheRebuild";
-    public const string VisibleImageRegionDraw = "VisibleImageRegionDraw";
-    public const string AnnotationDraw = "AnnotationDraw";
-    public const string Direct2DInitialize = "Direct2DInitialize";
     public const string Direct2DFrameRender = "Direct2DFrameRender";
     public const string Direct2DAnnotationDraw = "Direct2DAnnotationDraw";
-    public const string MosaicBlockBuild = "MosaicBlockBuild";
     public const string FinalImageRender = "FinalImageRender";
     public const string FrameInterval = "FrameInterval";
 
@@ -160,49 +153,14 @@ internal static class RenderPerformanceProbe
             AppendMilliseconds(builder, snapshot.P50Milliseconds);
             builder.Append("ms, p95=");
             AppendMilliseconds(builder, snapshot.P95Milliseconds);
+            builder.Append("ms, min=");
+            AppendMilliseconds(builder, snapshot.MinMilliseconds);
             builder.Append("ms, max=");
             AppendMilliseconds(builder, snapshot.MaxMilliseconds);
             builder.AppendLine("ms");
         }
 
         return builder.ToString().TrimEnd();
-    }
-
-    public static void ResetForSelfTest()
-    {
-        lock (SyncRoot)
-        {
-            Metrics.Clear();
-            enabled = false;
-            logPath = null;
-            lastFrameStartTimestamp = 0;
-            framesSinceSummary = 0;
-            summaryIntervalFrames = DefaultSummaryIntervalFrames;
-        }
-    }
-
-    public static void EnableForSelfTest()
-    {
-        lock (SyncRoot)
-        {
-            Metrics.Clear();
-            enabled = true;
-            logPath = null;
-            lastFrameStartTimestamp = 0;
-            framesSinceSummary = 0;
-            summaryIntervalFrames = DefaultSummaryIntervalFrames;
-        }
-    }
-
-    public static void RecordDurationForSelfTest(string metricName, TimeSpan duration)
-    {
-        if (!enabled)
-        {
-            return;
-        }
-
-        long ticks = (long)Math.Round(duration.TotalSeconds * Stopwatch.Frequency);
-        RecordTicks(metricName, Math.Max(0, ticks));
     }
 
     private static void RecordTicks(string metricName, long elapsedTicks)
@@ -223,7 +181,7 @@ internal static class RenderPerformanceProbe
             }
 
             stats.Add(elapsedTicks);
-            if (string.Equals(metricName, CanvasPaint, StringComparison.Ordinal) &&
+            if (string.Equals(metricName, Direct2DFrameRender, StringComparison.Ordinal) &&
                 framesSinceSummary >= summaryIntervalFrames)
             {
                 framesSinceSummary = 0;

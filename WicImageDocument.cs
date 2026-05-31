@@ -7,10 +7,9 @@ internal sealed class WicImageDocument : IDisposable
     public readonly int Width;
     public readonly int Height;
     public readonly byte[] Pixels;
-    public readonly string SourcePath;
     private bool disposed;
 
-    public WicImageDocument(string sourcePath, int width, int height, byte[] pixels)
+    public WicImageDocument(int width, int height, byte[] pixels)
     {
         if (width <= 0 || height <= 0)
         {
@@ -21,7 +20,6 @@ internal sealed class WicImageDocument : IDisposable
             throw new ArgumentException("Pixel buffer is too small.");
         }
 
-        SourcePath = sourcePath;
         Width = width;
         Height = height;
         Pixels = pixels;
@@ -46,7 +44,7 @@ internal sealed class WicImageDocument : IDisposable
                 pixels[i + 3] = 255;
             }
         }
-        return new WicImageDocument("synthetic.png", width, height, pixels);
+        return new WicImageDocument(width, height, pixels);
     }
 
     public void Save(string path)
@@ -153,7 +151,7 @@ internal static class WicCodec
             GetPixelExtent(converter, out width, out height);
             byte[] pixels = new byte[width * height * 4];
             CopyPixels(converter, width, height, pixels);
-            return new WicImageDocument(path, width, height, pixels);
+            return new WicImageDocument(width, height, pixels);
         }
         finally
         {

@@ -238,7 +238,6 @@ internal struct Rgba
 
     public static readonly Rgba Transparent = new Rgba(0, 0, 0, 0);
     public static readonly Rgba White = new Rgba(255, 255, 255, 255);
-    public static readonly Rgba Black = new Rgba(255, 0, 0, 0);
 
     private static byte ClampByte(int value)
     {
@@ -321,7 +320,6 @@ internal static class AppStyles
     public const int ToolbarSeparatorTop = 27;
     public const int ToolbarSeparatorHeight = 28;
     public const float DefaultStrokeWidth = 4f;
-    public const int AnimationFrameMilliseconds = 16;
 
     public static readonly Rgba AppBack = Rgba.FromRgb(18, 18, 18);
     public static readonly Rgba CanvasBack = Rgba.FromRgb(24, 24, 24);
@@ -330,10 +328,7 @@ internal static class AppStyles
     public static readonly Rgba ToolbarSeparator = Rgba.FromRgb(226, 230, 235);
     public static readonly Rgba ToolbarShadow = Rgba.FromArgb(32, 0, 0, 0);
     public static readonly Rgba ToolbarIcon = Rgba.FromRgb(31, 35, 40);
-    public static readonly Rgba ToolbarDisabled = Rgba.FromRgb(170, 176, 184);
     public static readonly Rgba ToolbarSelectedBack = Rgba.FromRgb(229, 242, 255);
-    public static readonly Rgba ToolbarHoverBack = Rgba.FromRgb(245, 247, 250);
-    public static readonly Rgba ToolbarPressedBack = Rgba.FromRgb(232, 236, 242);
     public static readonly Rgba FieldBack = Rgba.FromRgb(248, 250, 252);
     public static readonly Rgba MutedText = Rgba.FromRgb(94, 101, 112);
     public static readonly Rgba Accent = Rgba.FromRgb(0, 112, 224);

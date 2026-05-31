@@ -2828,11 +2828,20 @@ internal static class ClipboardBridge
             return;
         }
 
-        IntPtr dropMemory = CreateFileDropMemory(path);
-        IntPtr dibMemory = CreateDibMemory(width, height, pixels);
-        IntPtr pngMemory = CreateBytesMemory(File.ReadAllBytes(path));
-        if (Win32Api.OpenClipboard(owner))
+        IntPtr dropMemory = IntPtr.Zero;
+        IntPtr dibMemory = IntPtr.Zero;
+        IntPtr pngMemory = IntPtr.Zero;
+        try
         {
+            byte[] pngBytes = PngFormat == 0 ? null : File.ReadAllBytes(path);
+            dropMemory = CreateFileDropMemory(path);
+            dibMemory = CreateDibMemory(width, height, pixels);
+            pngMemory = pngBytes == null ? IntPtr.Zero : CreateBytesMemory(pngBytes);
+            if (!Win32Api.OpenClipboard(owner))
+            {
+                return;
+            }
+
             try
             {
                 Win32Api.EmptyClipboard();
@@ -2852,10 +2861,13 @@ internal static class ClipboardBridge
             finally
             {
                 Win32Api.CloseClipboard();
-                FreeGlobal(dropMemory);
-                FreeGlobal(dibMemory);
-                FreeGlobal(pngMemory);
             }
+        }
+        finally
+        {
+            FreeGlobal(dropMemory);
+            FreeGlobal(dibMemory);
+            FreeGlobal(pngMemory);
         }
     }
 

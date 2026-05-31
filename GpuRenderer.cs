@@ -117,29 +117,45 @@ internal sealed class GpuRenderer : IDisposable
     public void RenderToHdc(IntPtr hdc, int width, int height, GpuRect view, IList<AnnotationItem> items, AnnotationItem preview, int selectedIndex, bool drawToolbar, ToolMode tool, Rgba stroke, float strokeWidth, SettingsOverlayState settingsOverlay)
     {
         ThrowIfDisposed();
-        D2DApi.BindDC(target, hdc, width, height);
-        D2DApi.BeginDraw(target);
+        long probeStart = RenderPerformanceProbe.Start();
         try
         {
-            DrawScene(width, height, view, items, preview, selectedIndex, drawToolbar, tool, stroke, strokeWidth, settingsOverlay);
+            D2DApi.BindDC(target, hdc, width, height);
+            D2DApi.BeginDraw(target);
+            try
+            {
+                DrawScene(width, height, view, items, preview, selectedIndex, drawToolbar, tool, stroke, strokeWidth, settingsOverlay);
+            }
+            finally
+            {
+                D2DApi.EndDraw(target);
+            }
         }
         finally
         {
-            D2DApi.EndDraw(target);
+            RenderPerformanceProbe.Stop(RenderPerformanceProbe.Direct2DFrameRender, probeStart);
         }
     }
 
     public void RenderOffscreen(GpuRect view, IList<AnnotationItem> items)
     {
         ThrowIfDisposed();
-        D2DApi.BeginDraw(target);
+        long probeStart = RenderPerformanceProbe.Start();
         try
         {
-            DrawScene((int)view.Width, (int)view.Height, view, items, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+            D2DApi.BeginDraw(target);
+            try
+            {
+                DrawScene((int)view.Width, (int)view.Height, view, items, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
+            }
+            finally
+            {
+                D2DApi.EndDraw(target);
+            }
         }
         finally
         {
-            D2DApi.EndDraw(target);
+            RenderPerformanceProbe.Stop(RenderPerformanceProbe.Direct2DFrameRender, probeStart);
         }
     }
 
@@ -784,41 +800,6 @@ internal sealed class GpuRenderer : IDisposable
             return AppStyles.CancelAccent;
         }
         return AppStyles.ToolbarIcon;
-    }
-
-    private static string ToolbarLabel(ToolbarCommand command)
-    {
-        switch (command)
-        {
-            case ToolbarCommand.ToolRect:
-                return "□";
-            case ToolbarCommand.ToolEllipse:
-                return "○";
-            case ToolbarCommand.ToolArrow:
-                return "↗";
-            case ToolbarCommand.ToolPen:
-                return "\u7b14";
-            case ToolbarCommand.ToolMosaic:
-                return "\u9a6c";
-            case ToolbarCommand.ToolText:
-                return "\u5b57";
-            case ToolbarCommand.Undo:
-                return "↶";
-            case ToolbarCommand.Clear:
-                return "\u6e05";
-            case ToolbarCommand.Fit:
-                return "\u9002";
-            case ToolbarCommand.Pin:
-                return "\u7f6e";
-            case ToolbarCommand.Settings:
-                return "\u8bbe";
-            case ToolbarCommand.Cancel:
-                return "×";
-            case ToolbarCommand.Save:
-                return "✓";
-            default:
-                return "?";
-        }
     }
 
     private IntPtr GetBrush(Rgba rgba)
