@@ -67,7 +67,7 @@ internal static class Program
             string path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(args[0].Trim('"')));
             if (!File.Exists(path))
             {
-                throw new FileNotFoundException("Image file does not exist.", path);
+                throw new InvalidOperationException(UiText.ImageFileDoesNotExist + Environment.NewLine + path);
             }
             return path;
         }
@@ -78,7 +78,7 @@ internal static class Program
             return clipboardFile;
         }
 
-        throw new InvalidOperationException("No image found. Copy an image file first, or pass an image path as the first argument.");
+        throw new InvalidOperationException(UiText.NoImageFound);
     }
 
     private static string GetConfiguredOutputDirectory(string[] args)
@@ -102,7 +102,7 @@ internal static class Program
             {
                 if (i + 1 >= args.Length)
                 {
-                    throw new ArgumentException("--output-dir requires a directory path.");
+                    throw new ArgumentException(UiText.OutputDirectoryArgumentRequired);
                 }
                 outputDirectory = args[++i];
             }

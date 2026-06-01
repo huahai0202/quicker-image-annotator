@@ -107,6 +107,8 @@ internal static class Win32Api
     public const uint MbOk = 0x00000000;
     public const uint MbYesNo = 0x00000004;
     public const int IdYes = 6;
+    private const uint SpiGetNonClientMetrics = 0x0029;
+    private const int LfFaceSize = 32;
     public const uint CfHdrop = 15;
     public const uint CfUnicodeText = 13;
     public const uint CfDib = 8;
@@ -215,6 +217,47 @@ internal static class Win32Api
         public int iImage;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct LogFont
+    {
+        public int lfHeight;
+        public int lfWidth;
+        public int lfEscapement;
+        public int lfOrientation;
+        public int lfWeight;
+        public byte lfItalic;
+        public byte lfUnderline;
+        public byte lfStrikeOut;
+        public byte lfCharSet;
+        public byte lfOutPrecision;
+        public byte lfClipPrecision;
+        public byte lfQuality;
+        public byte lfPitchAndFamily;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = LfFaceSize)]
+        public string lfFaceName;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NonClientMetrics
+    {
+        public int cbSize;
+        public int iBorderWidth;
+        public int iScrollWidth;
+        public int iScrollHeight;
+        public int iCaptionWidth;
+        public int iCaptionHeight;
+        public LogFont lfCaptionFont;
+        public int iSmCaptionWidth;
+        public int iSmCaptionHeight;
+        public LogFont lfSmCaptionFont;
+        public int iMenuWidth;
+        public int iMenuHeight;
+        public LogFont lfMenuFont;
+        public LogFont lfStatusFont;
+        public LogFont lfMessageFont;
+        public int iPaddedBorderWidth;
+    }
+
     [DllImport("user32.dll", EntryPoint = "RegisterClassExW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     public static extern ushort RegisterClassEx(ref WndClassEx lpwcx);
 
@@ -319,6 +362,9 @@ internal static class Win32Api
 
     [DllImport("user32.dll", EntryPoint = "MessageBoxW", ExactSpelling = true)]
     private static extern int MessageBoxPtr(IntPtr hWnd, IntPtr lpText, IntPtr lpCaption, uint uType);
+
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref NonClientMetrics pvParam, uint fWinIni);
 
     [DllImport("user32.dll")]
     public static extern short GetKeyState(int nVirtKey);
@@ -470,6 +516,32 @@ internal static class Win32Api
         }
     }
 
+    public static string GetSystemMessageFontName()
+    {
+        try
+        {
+            NonClientMetrics metrics = new NonClientMetrics();
+            metrics.cbSize = Marshal.SizeOf(typeof(NonClientMetrics));
+            if (SystemParametersInfo(SpiGetNonClientMetrics, (uint)metrics.cbSize, ref metrics, 0))
+            {
+                string face = metrics.lfMessageFont.lfFaceName;
+                if (!string.IsNullOrEmpty(face))
+                {
+                    face = face.TrimEnd('\0').Trim();
+                    if (face.Length > 0)
+                    {
+                        return face;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return "Segoe UI";
+    }
+
     public static int GetX(IntPtr lParam)
     {
         return (short)((long)lParam & 0xffff);
@@ -492,7 +564,7 @@ internal static class DWriteApi
     private static IntPtr sharedFactory;
 
     private const int FactoryTypeShared = 0;
-    private const int WeightBold = 700;
+    private const int WeightNormal = 400;
     private const int StyleNormal = 0;
     private const int StretchNormal = 5;
     private static readonly Guid FactoryId = new Guid("b859ee5a-d838-4b5b-a2e8-1adc7d93db48");
@@ -562,7 +634,7 @@ internal static class DWriteApi
     {
         IntPtr format;
         CreateTextFormatDelegate create = ComUtil.GetDelegate<CreateTextFormatDelegate>(factory, 15);
-        ComUtil.Check(create(factory, family, IntPtr.Zero, WeightBold, StyleNormal, StretchNormal, em, "zh-cn", out format), "CreateTextFormat");
+        ComUtil.Check(create(factory, family, IntPtr.Zero, WeightNormal, StyleNormal, StretchNormal, em, "zh-cn", out format), "CreateTextFormat");
         return format;
     }
 

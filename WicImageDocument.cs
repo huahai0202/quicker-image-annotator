@@ -127,12 +127,12 @@ internal static class WicCodec
     {
         if (string.IsNullOrWhiteSpace(path))
         {
-            throw new ArgumentException("Image path is empty.");
+            throw new ArgumentException(UiText.ImagePathIsEmpty);
         }
         path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim('"')));
         if (!File.Exists(path))
         {
-            throw new FileNotFoundException("Image file does not exist.", path);
+            throw new InvalidOperationException(UiText.ImageFileDoesNotExist + Environment.NewLine + path);
         }
 
         IntPtr factory = IntPtr.Zero;

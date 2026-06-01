@@ -81,6 +81,10 @@ internal static class UiText
     public const string Settings = "\u8bbe\u7f6e";
     public const string ClearConfirmTitle = "\u6e05\u7a7a\u6807\u6ce8";
     public const string ClearConfirmMessage = "\u786e\u5b9a\u8981\u6e05\u7a7a\u5f53\u524d\u6807\u6ce8\u5185\u5bb9\u5417\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002";
+    public const string NoImageFound = "\u672a\u627e\u5230\u56fe\u7247\u3002\u8bf7\u5148\u590d\u5236\u4e00\u5f20\u56fe\u7247\uff0c\u6216\u5c06\u56fe\u7247\u8def\u5f84\u4f5c\u4e3a\u7b2c\u4e00\u4e2a\u53c2\u6570\u4f20\u5165\u3002";
+    public const string ImagePathIsEmpty = "\u56fe\u7247\u8def\u5f84\u4e0d\u80fd\u4e3a\u7a7a\u3002";
+    public const string ImageFileDoesNotExist = "\u627e\u4e0d\u5230\u56fe\u7247\u6587\u4ef6\uff1a";
+    public const string OutputDirectoryArgumentRequired = "--output-dir \u9700\u8981\u6307\u5b9a\u4fdd\u5b58\u76ee\u5f55\u8def\u5f84\u3002";
     public const string GpuFatal = "GPU/Direct2D \u6e32\u67d3\u5931\u8d25\uff0c\u65e0\u6cd5\u7ee7\u7eed\u8fd0\u884c\u3002";
 }
 
@@ -451,7 +455,7 @@ internal sealed class TextLayoutCache : IDisposable
 
 internal static class AppStyles
 {
-    public const string UiFontName = "Microsoft YaHei UI";
+    public static readonly string UiFontName = Win32Api.GetSystemMessageFontName();
     public const int ToolbarHeight = 82;
     public const int ToolbarButtonTop = 23;
     public const int ToolbarButtonSide = 36;
