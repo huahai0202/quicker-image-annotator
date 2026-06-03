@@ -5,6 +5,17 @@ using System.Runtime.InteropServices;
 internal sealed class GpuRenderer : IDisposable
 {
     private const int TextBoundsCacheLimit = 256;
+    private const float CrispInterpolationScaleThreshold = 0.85f;
+    private const float SettingsPanelMinWidth = 520f;
+    private const float SettingsPanelMaxWidth = 700f;
+    private const float SettingsPanelHeight = 396f;
+    private const float SettingsPanelPadding = 28f;
+    private const float SettingsFieldHeight = 36f;
+    private const float SettingsActionHeight = 34f;
+    private const float SettingsBrowseWidth = 86f;
+    private const float SettingsClearWidth = 72f;
+    private const float SettingsButtonGap = 10f;
+    private const float SettingsFieldButtonGap = 14f;
     private static readonly object TextBoundsCacheSync = new object();
     private static readonly Dictionary<string, GpuRect> TextBoundsCache = new Dictionary<string, GpuRect>(StringComparer.Ordinal);
     private readonly IntPtr factory;
@@ -122,76 +133,51 @@ internal sealed class GpuRenderer : IDisposable
     public void RenderToHdc(IntPtr hdc, int width, int height, GpuRect view, IList<AnnotationItem> items, AnnotationItem preview, int selectedIndex, bool drawToolbar, ToolMode tool, Rgba stroke, float strokeWidth, SettingsOverlayState settingsOverlay)
     {
         ThrowIfDisposed();
-        long probeStart = RenderPerformanceProbe.Start();
+        D2DApi.BindDC(target, hdc, width, height);
+        D2DApi.BeginDraw(target);
         try
         {
-            D2DApi.BindDC(target, hdc, width, height);
-            D2DApi.BeginDraw(target);
-            try
-            {
-                DrawScene(width, height, view, items, preview, selectedIndex, drawToolbar, tool, stroke, strokeWidth, settingsOverlay);
-            }
-            finally
-            {
-                D2DApi.EndDraw(target);
-            }
+            DrawScene(width, height, view, items, preview, selectedIndex, drawToolbar, tool, stroke, strokeWidth, settingsOverlay);
         }
         finally
         {
-            RenderPerformanceProbe.Stop(RenderPerformanceProbe.Direct2DFrameRender, probeStart);
+            D2DApi.EndDraw(target);
         }
     }
 
     public void RenderOffscreen(GpuRect view, IList<AnnotationItem> items)
     {
         ThrowIfDisposed();
-        long probeStart = RenderPerformanceProbe.Start();
+        D2DApi.BeginDraw(target);
         try
         {
-            D2DApi.BeginDraw(target);
-            try
-            {
-                DrawScene((int)view.Width, (int)view.Height, view, items, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
-            }
-            finally
-            {
-                D2DApi.EndDraw(target);
-            }
+            DrawScene((int)view.Width, (int)view.Height, view, items, null, -1, false, ToolMode.Rect, AppStyles.DefaultStroke, AppStyles.DefaultStrokeWidth, null);
         }
         finally
         {
-            RenderPerformanceProbe.Stop(RenderPerformanceProbe.Direct2DFrameRender, probeStart);
+            D2DApi.EndDraw(target);
         }
     }
 
     public static byte[] RenderExport(WicImageDocument document, IList<AnnotationItem> items)
     {
-        long probeStart = RenderPerformanceProbe.Start();
-        try
+        using (WicPixelStore store = WicCodec.CreateStore(document.Width, document.Height))
+        using (GpuRenderer renderer = CreateForStore(document, store))
         {
-            using (WicPixelStore store = WicCodec.CreateStore(document.Width, document.Height))
-            using (GpuRenderer renderer = CreateForStore(document, store))
-            {
-                renderer.RenderOffscreen(new GpuRect(0, 0, document.Width, document.Height), items);
-                return store.CopyPixels();
-            }
-        }
-        finally
-        {
-            RenderPerformanceProbe.Stop(RenderPerformanceProbe.FinalImageRender, probeStart);
+            renderer.RenderOffscreen(new GpuRect(0, 0, document.Width, document.Height), items);
+            return store.CopyPixels();
         }
     }
 
     private void DrawScene(int width, int height, GpuRect view, IList<AnnotationItem> items, AnnotationItem preview, int selectedIndex, bool drawToolbar, ToolMode tool, Rgba stroke, float strokeWidth, SettingsOverlayState settingsOverlay)
     {
-        RenderPerformanceProbe.MarkFrameStart();
         D2DApi.SetTransform(target, D2DApi.Matrix.Identity);
         D2DApi.Clear(target, AppStyles.CanvasBack);
 
-        GpuRect source = new GpuRect(0, 0, sourceWidth, sourceHeight);
-        D2DApi.DrawImageSection(target, sourceImage, view, source, D2DApi.InterpolationLinear);
-
         float scale = view.Width / Math.Max(1f, sourceWidth);
+        GpuRect source = new GpuRect(0, 0, sourceWidth, sourceHeight);
+        D2DApi.DrawImageSection(target, sourceImage, view, source, GetSourceImageInterpolation(scale));
+
         D2DApi.SetTransform(target, D2DApi.Matrix.ScaleTranslate(scale, view.X, view.Y));
         int skipIndex = preview != null && preview.TextEditing && selectedIndex >= 0 ? selectedIndex : -1;
         DrawAnnotations(items, skipIndex);
@@ -225,25 +211,17 @@ internal sealed class GpuRenderer : IDisposable
 
     private void DrawAnnotations(IList<AnnotationItem> items, int skipIndex)
     {
-        long probeStart = RenderPerformanceProbe.Start();
-        try
+        if (items == null)
         {
-            if (items == null)
-            {
-                return;
-            }
-            for (int i = 0; i < items.Count; i++)
-            {
-                if (i == skipIndex)
-                {
-                    continue;
-                }
-                DrawAnnotation(items[i]);
-            }
+            return;
         }
-        finally
+        for (int i = 0; i < items.Count; i++)
         {
-            RenderPerformanceProbe.Stop(RenderPerformanceProbe.Direct2DAnnotationDraw, probeStart);
+            if (i == skipIndex)
+            {
+                continue;
+            }
+            DrawAnnotation(items[i]);
         }
     }
 
@@ -521,8 +499,8 @@ internal sealed class GpuRenderer : IDisposable
         D2DApi.FillRoundedRectangle(target, new GpuRect(pill.X, pill.Y + 3, pill.Width, pill.Height), 10f, GetBrush(AppStyles.ToolbarShadow));
         D2DApi.FillRoundedRectangle(target, pill, 10f, surface);
         D2DApi.DrawRoundedRectangle(target, pill, 10f, border, 1f, roundStroke);
-        DrawToolbarSeparator(284);
-        DrawToolbarSeparator(519);
+        DrawToolbarSeparator(326);
+        DrawToolbarSeparator(561);
 
         ToolbarCommand[] commands = GpuAnnotatorWindow.ToolbarCommands;
         for (int i = 0; i < commands.Length; i++)
@@ -594,6 +572,13 @@ internal sealed class GpuRenderer : IDisposable
                         }
                     }
                 }
+                break;
+            case ToolbarCommand.Ocr:
+                DrawCorner(cx - 11, cy - 10, 1, 1, brush);
+                DrawCorner(cx + 11, cy - 10, -1, 1, brush);
+                DrawCorner(cx - 11, cy + 10, 1, -1, brush);
+                DrawCorner(cx + 11, cy + 10, -1, -1, brush);
+                DrawUiTextLayout("OCR", 8.5f, cx - 11f, cy - 6f, 24f, 14f, brush);
                 break;
             case ToolbarCommand.Undo:
                 DrawIconLine(new GpuPoint(cx + 8, cy + 7), new GpuPoint(cx + 3, cy - 1), brush, line);
@@ -737,6 +722,11 @@ internal sealed class GpuRenderer : IDisposable
             tool == ToolMode.Text;
     }
 
+    private static int GetSourceImageInterpolation(float scale)
+    {
+        return scale >= CrispInterpolationScaleThreshold ? D2DApi.InterpolationNearest : D2DApi.InterpolationLinear;
+    }
+
     public static GpuRect GetToolOptionsPanelRect()
     {
         return new GpuRect(20, AppStyles.ToolbarHeight + 9, 382, 54);
@@ -756,62 +746,141 @@ internal sealed class GpuRenderer : IDisposable
 
     private void DrawSettingsOverlay(int clientWidth, int clientHeight, SettingsOverlayState overlay)
     {
-        IntPtr shade = GetBrush(Rgba.FromArgb(118, 0, 0, 0));
+        IntPtr shade = GetBrush(Rgba.FromArgb(126, 0, 0, 0));
         D2DApi.FillRectangle(target, new GpuRect(0, 0, clientWidth, clientHeight), shade);
         GpuRect panel = GetSettingsOverlayPanel(clientWidth, clientHeight);
-        D2DApi.FillRoundedRectangle(target, new GpuRect(panel.X + 1, panel.Y + 8, panel.Width, panel.Height), 8f, GetBrush(Rgba.FromArgb(42, 0, 0, 0)));
-        D2DApi.FillRoundedRectangle(target, panel, 8f, GetBrush(Rgba.White));
-        D2DApi.DrawRoundedRectangle(target, panel, 8f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
-        DrawUiTextLayout(UiText.SaveDirectory, 15f, panel.X + 24f, panel.Y + 20f, panel.Width - 48f, 26f, GetBrush(AppStyles.ToolbarIcon));
-        string value = overlay.OutputDirectory ?? string.Empty;
-        GpuRect field = GetSettingsOutputRect(panel);
-        D2DApi.FillRoundedRectangle(target, field, 5f, GetBrush(AppStyles.FieldBack));
-        D2DApi.DrawRoundedRectangle(target, field, 5f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
-        DrawUiTextLayout(value, 12f, field.X + 11f, field.Y + 8f, field.Width - 22f, field.Height - 10f, GetBrush(AppStyles.ToolbarIcon));
-        string hint = UiText.EmptyOutputDirectoryHintPrefix + GetClipboardTempDirectory();
-        DrawUiTextLayout(hint, 12f, field.X, field.Bottom + 10f, panel.Width - 48f, 34f, GetBrush(AppStyles.MutedText));
-        DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Browse), UiText.Browse, AppStyles.Accent, false);
-        DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Clear), UiText.Clear, AppStyles.ToolbarIcon, false);
+        D2DApi.FillRoundedRectangle(target, new GpuRect(panel.X + 2, panel.Y + 12, panel.Width, panel.Height), 14f, GetBrush(Rgba.FromArgb(46, 0, 0, 0)));
+        D2DApi.FillRoundedRectangle(target, panel, 14f, GetBrush(Rgba.White));
+        D2DApi.DrawRoundedRectangle(target, panel, 14f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
+
+        DrawUiTextLayout(UiText.SettingsTitle, 20f, panel.X + SettingsPanelPadding, panel.Y + 22f, panel.Width - SettingsPanelPadding * 2f, 30f, GetBrush(AppStyles.ToolbarIcon));
+        DrawUiTextLayout(UiText.SettingsSubtitle, 12f, panel.X + SettingsPanelPadding, panel.Y + 51f, panel.Width - SettingsPanelPadding * 2f, 22f, GetBrush(AppStyles.MutedText));
+        D2DApi.FillRectangle(target, new GpuRect(panel.X + SettingsPanelPadding, panel.Y + 76f, panel.Width - SettingsPanelPadding * 2f, 1f), GetBrush(AppStyles.ToolbarBorder));
+
+        DrawDirectorySetting(
+            panel,
+            UiText.SaveDirectory,
+            overlay.OutputDirectory,
+            UiText.DirectoryNotSet,
+            UiText.EmptyOutputDirectoryHintPrefix + GetClipboardTempDirectory(),
+            SettingsOverlayCommand.BrowseOutput,
+            SettingsOverlayCommand.ClearOutput);
+        DrawDirectorySetting(
+            panel,
+            UiText.ScreenshotDirectory,
+            overlay.ScreenshotDirectory,
+            UiText.ScreenshotDirectoryNotSet,
+            UiText.EmptyScreenshotDirectoryHintPrefix + GetClipboardTempDirectory(),
+            SettingsOverlayCommand.BrowseScreenshot,
+            SettingsOverlayCommand.ClearScreenshot);
+
+        DrawSettingsToggle(GetSettingsButtonRect(panel, SettingsOverlayCommand.ToggleAutoStart), UiText.AutoStart, overlay.AutoStartEnabled);
+        DrawSettingsToggle(GetSettingsButtonRect(panel, SettingsOverlayCommand.ToggleGlobalHotkey), UiText.GlobalHotkey + AppFeatures.GlobalHotkeyText, overlay.GlobalHotkeyEnabled);
         DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Save), UiText.Save, AppStyles.SaveAccent, true);
         DrawOverlayButton(GetSettingsButtonRect(panel, SettingsOverlayCommand.Cancel), UiText.Cancel, AppStyles.CancelAccent, false);
     }
 
+    private void DrawDirectorySetting(GpuRect panel, string label, string value, string emptyText, string hint, SettingsOverlayCommand browseCommand, SettingsOverlayCommand clearCommand)
+    {
+        GpuRect field = browseCommand == SettingsOverlayCommand.BrowseOutput ? GetSettingsOutputRect(panel) : GetSettingsScreenshotRect(panel);
+        bool empty = string.IsNullOrWhiteSpace(value);
+        string display = empty ? emptyText : value;
+        Rgba displayColor = empty ? AppStyles.MutedText : AppStyles.ToolbarIcon;
+        DrawUiTextLayout(label, 13f, field.X, field.Y - 25f, field.Width, 22f, GetBrush(AppStyles.ToolbarIcon));
+        D2DApi.FillRoundedRectangle(target, field, 8f, GetBrush(AppStyles.FieldBack));
+        D2DApi.DrawRoundedRectangle(target, field, 8f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
+        DrawUiTextLayout(display, 12f, field.X + 12f, field.Y + 9f, field.Width - 24f, field.Height - 10f, GetBrush(displayColor));
+        DrawUiTextLayout(hint, 11.5f, field.X, field.Bottom + 7f, panel.Width - SettingsPanelPadding * 2f, 24f, GetBrush(AppStyles.MutedText));
+        DrawOverlayButton(GetSettingsButtonRect(panel, browseCommand), UiText.Browse, AppStyles.Accent, false);
+        DrawOverlayButton(GetSettingsButtonRect(panel, clearCommand), UiText.Clear, AppStyles.ToolbarIcon, false);
+    }
+
+    private void DrawSettingsToggle(GpuRect rect, string text, bool enabled)
+    {
+        DrawUiTextLayout(text, 13f, rect.X, rect.Y + 5f, rect.Width - 62f, 24f, GetBrush(AppStyles.ToolbarIcon));
+        GpuRect track = new GpuRect(rect.Right - 48f, rect.Y + 5f, 44f, 24f);
+        Rgba trackFill = enabled ? AppStyles.Accent : Rgba.FromRgb(217, 223, 232);
+        D2DApi.FillRoundedRectangle(target, track, 12f, GetBrush(trackFill));
+        if (!enabled)
+        {
+            D2DApi.DrawRoundedRectangle(target, track, 12f, GetBrush(AppStyles.ToolbarBorder), 1f, roundStroke);
+        }
+        float knobX = enabled ? track.Right - 21f : track.X + 3f;
+        GpuRect knob = new GpuRect(knobX, track.Y + 3f, 18f, 18f);
+        D2DApi.FillEllipse(target, new GpuRect(knob.X, knob.Y + 1f, knob.Width, knob.Height), GetBrush(Rgba.FromArgb(38, 0, 0, 0)));
+        D2DApi.FillEllipse(target, knob, GetBrush(Rgba.White));
+    }
+
     private void DrawOverlayButton(GpuRect rect, string text, Rgba color, bool primary)
     {
-        Rgba fill = primary ? color : Tint(color, 0.94f);
+        Rgba fill = primary ? color : Tint(color, 0.96f);
         Rgba textColor = primary ? Rgba.White : color;
-        D2DApi.FillRoundedRectangle(target, rect, 5f, GetBrush(fill));
-        D2DApi.DrawRoundedRectangle(target, rect, 5f, GetBrush(color), primary ? 0.8f : 1.2f, roundStroke);
+        if (primary)
+        {
+            D2DApi.FillRoundedRectangle(target, new GpuRect(rect.X, rect.Y + 2f, rect.Width, rect.Height), 8f, GetBrush(Rgba.FromArgb(26, 0, 0, 0)));
+        }
+        D2DApi.FillRoundedRectangle(target, rect, 8f, GetBrush(fill));
+        D2DApi.DrawRoundedRectangle(target, rect, 8f, GetBrush(color), primary ? 0.8f : 1.1f, roundStroke);
         DrawUiTextLayout(text, 13f, rect.X + 10f, rect.Y + 8f, rect.Width - 20f, rect.Height - 10f, GetBrush(textColor));
     }
 
     public static GpuRect GetSettingsOverlayPanel(int clientWidth, int clientHeight)
     {
-        float width = Math.Min(620f, Math.Max(380f, clientWidth - 48f));
-        float height = 190f;
+        float width = Math.Min(SettingsPanelMaxWidth, Math.Max(SettingsPanelMinWidth, clientWidth - 48f));
+        float height = SettingsPanelHeight;
         return new GpuRect((clientWidth - width) / 2f, Math.Max(16f, (clientHeight - height) / 2f), width, height);
     }
 
     public static GpuRect GetSettingsOutputRect(GpuRect panel)
     {
-        return new GpuRect(panel.X + 24, panel.Y + 50, Math.Max(160f, panel.Width - 170f), 34);
+        return GetSettingsDirectoryRect(panel, panel.Y + 106f);
+    }
+
+    public static GpuRect GetSettingsScreenshotRect(GpuRect panel)
+    {
+        return GetSettingsDirectoryRect(panel, panel.Y + 198f);
     }
 
     public static GpuRect GetSettingsButtonRect(GpuRect panel, SettingsOverlayCommand command)
     {
         switch (command)
         {
-            case SettingsOverlayCommand.Browse:
-                return new GpuRect(panel.Right - 110, panel.Y + 49, 82, 30);
-            case SettingsOverlayCommand.Clear:
-                return new GpuRect(panel.Right - 110, panel.Y + 86, 82, 30);
+            case SettingsOverlayCommand.BrowseOutput:
+                return GetSettingsBrowseButtonRect(GetSettingsOutputRect(panel));
+            case SettingsOverlayCommand.ClearOutput:
+                return GetSettingsClearButtonRect(GetSettingsOutputRect(panel));
+            case SettingsOverlayCommand.BrowseScreenshot:
+                return GetSettingsBrowseButtonRect(GetSettingsScreenshotRect(panel));
+            case SettingsOverlayCommand.ClearScreenshot:
+                return GetSettingsClearButtonRect(GetSettingsScreenshotRect(panel));
+            case SettingsOverlayCommand.ToggleAutoStart:
+                return new GpuRect(panel.X + SettingsPanelPadding, panel.Y + 278f, panel.Width - SettingsPanelPadding * 2f, 32f);
+            case SettingsOverlayCommand.ToggleGlobalHotkey:
+                return new GpuRect(panel.X + SettingsPanelPadding, panel.Y + 314f, panel.Width - SettingsPanelPadding * 2f, 32f);
             case SettingsOverlayCommand.Cancel:
-                return new GpuRect(panel.Right - 110, panel.Bottom - 41, 82, 30);
+                return new GpuRect(panel.Right - SettingsPanelPadding - 92f, panel.Bottom - 48f, 92f, SettingsActionHeight);
             case SettingsOverlayCommand.Save:
-                return new GpuRect(panel.Right - 200, panel.Bottom - 41, 82, 30);
+                return new GpuRect(panel.Right - SettingsPanelPadding - 192f, panel.Bottom - 48f, 92f, SettingsActionHeight);
             default:
                 return new GpuRect();
         }
+    }
+
+    private static GpuRect GetSettingsDirectoryRect(GpuRect panel, float y)
+    {
+        float buttonWidth = SettingsBrowseWidth + SettingsClearWidth + SettingsButtonGap + SettingsFieldButtonGap;
+        float width = Math.Max(180f, panel.Width - SettingsPanelPadding * 2f - buttonWidth);
+        return new GpuRect(panel.X + SettingsPanelPadding, y, width, SettingsFieldHeight);
+    }
+
+    private static GpuRect GetSettingsBrowseButtonRect(GpuRect field)
+    {
+        return new GpuRect(field.Right + SettingsFieldButtonGap, field.Y, SettingsBrowseWidth, SettingsActionHeight);
+    }
+
+    private static GpuRect GetSettingsClearButtonRect(GpuRect field)
+    {
+        return new GpuRect(field.Right + SettingsFieldButtonGap + SettingsBrowseWidth + SettingsButtonGap, field.Y, SettingsClearWidth, SettingsActionHeight);
     }
 
     private static string GetClipboardTempDirectory()

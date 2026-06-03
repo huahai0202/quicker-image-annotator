@@ -29,7 +29,7 @@
 - `GpuAnnotatorWindow.cs`
   - Win32 窗口、工具栏、鼠标、滚轮、键盘、IME composition、保存、设置 overlay 和剪贴板桥接。
 - `AnnotatorApp.cs`
-  - 程序入口、参数解析、自检、GPU 基准报告。
+  - 程序入口、GUI/截图/后台热键入口和自检。
 
 ### 1.2 已迁移功能
 
@@ -49,7 +49,7 @@
   - `CF_DIB` / `CF_DIBV5`。
 - 文本剪贴板：
   - `CF_UNICODETEXT` 支持文字编辑态 `Ctrl+C/X/V`。
-- `--render-profile` 和 `--render-benchmark` 继续保留。
+- 面向用户的渲染性能 CLI 开关已移除；基准仅作为自检 smoke 覆盖保留。
 
 ### 1.3 交互行为
 
@@ -82,6 +82,7 @@
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -SelfTest
 powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x64 -SelfTest
+powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x86 -SelfTest
 ```
 
 当前自检覆盖：
@@ -96,11 +97,7 @@ powershell -ExecutionPolicy Bypass -File .\BuildAndRun.ps1 -Platform x64 -SelfTe
 - 剪贴板 PNG、DIB 和保存输出回读。
 - GPU 基准 smoke test。
 
-2026-05-30 x64 交互路径基准见：
-
-```text
-docs/superpowers/specs/2026-05-30-render-benchmark.md
-```
+2026-05-30 x64 交互路径历史基准记录保留在同目录的性能基准文档中。
 
 最新 60 帧结果：
 
@@ -117,8 +114,9 @@ GitHub 发布或推送构建时需要同时更新：
 
 - `AnnotatorApp.exe`
 - `AnnotatorApp-x64.exe`
+- `AnnotatorApp-x86.exe`
 
-`BuildAndRun.ps1` 默认生成 `AnnotatorApp.exe`，使用 `-Platform x64` 生成 `AnnotatorApp-x64.exe`。
+`BuildAndRun.ps1` 默认生成 `AnnotatorApp.exe`，使用 `-Platform x64` / `-Platform x86` 分别生成对应平台构建。
 
 ## 4. 剩余风险
 

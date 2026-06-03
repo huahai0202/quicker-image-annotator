@@ -19,6 +19,7 @@ internal enum ToolbarCommand
     ToolPen,
     ToolMosaic,
     ToolText,
+    Ocr,
     Undo,
     Clear,
     Fit,
@@ -31,8 +32,12 @@ internal enum ToolbarCommand
 internal enum SettingsOverlayCommand
 {
     None,
-    Browse,
-    Clear,
+    BrowseOutput,
+    ClearOutput,
+    BrowseScreenshot,
+    ClearScreenshot,
+    ToggleAutoStart,
+    ToggleGlobalHotkey,
     Save,
     Cancel
 }
@@ -62,19 +67,61 @@ internal enum SelectionHandle
 internal static class UiText
 {
     public const string AppName = "\u56fe\u7247\u6807\u6ce8";
-    public const string SaveDirectory = "\u4fdd\u5b58\u76ee\u5f55";
+    public const string SettingsTitle = "\u8bbe\u7f6e";
+    public const string SettingsSubtitle = "\u4fdd\u5b58\u4f4d\u7f6e\u4e0e\u542f\u52a8\u9009\u9879";
+    public const string SaveDirectory = "\u6807\u6ce8\u4fdd\u5b58\u76ee\u5f55";
+    public const string ScreenshotDirectory = "\u622a\u56fe\u4fdd\u5b58\u76ee\u5f55";
+    public const string DirectoryNotSet = "\u672a\u8bbe\u7f6e";
+    public const string ScreenshotDirectoryNotSet = "\u8ddf\u968f\u6807\u6ce8\u4fdd\u5b58\u76ee\u5f55";
     public const string EmptyOutputDirectoryHintPrefix = "\u7559\u7a7a\uff1a\u672c\u5730\u56fe\u7247\u5b58\u539f\u76ee\u5f55\uff0c\u526a\u8d34\u677f\u56fe\u7247\u5b58 ";
+    public const string EmptyScreenshotDirectoryHintPrefix = "\u7559\u7a7a\uff1a\u8ddf\u968f\u6807\u6ce8\u4fdd\u5b58\u76ee\u5f55\uff1b\u90fd\u4e3a\u7a7a\u65f6\u5b58 ";
     public const string Browse = "\u6d4f\u89c8...";
     public const string Clear = "\u6e05\u7a7a";
     public const string Cancel = "\u53d6\u6d88";
+    public const string Close = "\u5173\u95ed";
     public const string Save = "\u4fdd\u5b58";
     public const string SelectOutputDirectory = "\u9009\u62e9\u6807\u6ce8\u4fdd\u5b58\u76ee\u5f55";
+    public const string SelectScreenshotDirectory = "\u9009\u62e9\u622a\u56fe\u4fdd\u5b58\u76ee\u5f55";
+    public const string AutoStart = "\u5f00\u673a\u81ea\u542f";
+    public const string GlobalHotkey = "\u5168\u5c40\u5feb\u6377\u952e ";
+    public const string HotkeyLabel = "\u5feb\u6377\u952e";
+    public const string HotkeyRequired = "\u8bf7\u8bbe\u7f6e\u81f3\u5c11\u4e00\u4e2a\u4fee\u9970\u952e\u548c\u4e00\u4e2a\u4e3b\u952e\u3002";
+    public const string StartupSettingFailed = "\u5f00\u673a\u81ea\u542f\u8bbe\u7f6e\u5931\u8d25\uff1a";
+    public const string GlobalHotkeyStartFailed = "\u5168\u5c40\u5feb\u6377\u952e\u672a\u542f\u52a8\uff0cAlt+A \u53ef\u80fd\u5df2\u88ab\u5176\u4ed6\u7a0b\u5e8f\u5360\u7528\u3002";
+    public const string GlobalHotkeyStopFailed = "\u5168\u5c40\u5feb\u6377\u952e\u672a\u80fd\u7acb\u5373\u505c\u7528\uff0c\u8bf7\u91cd\u542f\u7a0b\u5e8f\u540e\u518d\u8bd5\u3002";
+    public const string AboutTitle = "\u5173\u4e8e";
     public const string Rect = "\u77e9\u5f62";
     public const string Ellipse = "\u692d\u5706";
     public const string Arrow = "\u7bad\u5934";
     public const string Pen = "\u753b\u7b14";
     public const string Mosaic = "\u9a6c\u8d5b\u514b";
     public const string Text = "\u6587\u5b57";
+    public const string Ocr = "OCR";
+    public const string OcrTitle = "OCR \u8bc6\u522b";
+    public const string OcrResultTitle = "OCR \u7ed3\u679c";
+    public const string OcrSettings = "\u767e\u5ea6 OCR";
+    public const string OcrApiKey = "API Key";
+    public const string OcrSecretKey = "Secret Key";
+    public const string OcrEngine = "\u8bc6\u522b\u7248\u672c";
+    public const string OcrLayout = "\u7ed3\u679c\u6392\u7248";
+    public const string OcrStandard = "\u6807\u51c6\u7248";
+    public const string OcrAccurate = "\u9ad8\u7cbe\u5ea6\u7248";
+    public const string OcrLines = "\u9010\u884c";
+    public const string OcrSmartParagraph = "\u667a\u80fd\u6bb5\u843d";
+    public const string OcrTranslate = "\u8c37\u6b4c\u7ffb\u8bd1";
+    public const string OcrCopy = "\u590d\u5236";
+    public const string OcrCopied = "\u5df2\u590d\u5236";
+    public const string OcrTranslating = "\u6b63\u5728\u7ffb\u8bd1...";
+    public const string OcrTranslated = "\u5df2\u7ffb\u8bd1";
+    public const string OcrTranslateFailed = "\u8c37\u6b4c\u7ffb\u8bd1\u5931\u8d25\uff1a";
+    public const string OcrNoText = "\u672a\u8bc6\u522b\u5230\u6587\u5b57\u3002";
+    public const string OcrRunning = "\u6b63\u5728\u8c03\u7528\u767e\u5ea6 OCR\uff0c\u8bf7\u7a0d\u5019...";
+    public const string OcrCredentialsMissing = "\u8bf7\u5148\u5728\u8bbe\u7f6e\u91cc\u586b\u5199\u767e\u5ea6 OCR API Key \u548c Secret Key\u3002";
+    public const string OcrEmptyImage = "\u6ca1\u6709\u53ef\u7528\u7684 OCR \u56fe\u7247\u6570\u636e\u3002";
+    public const string OcrTokenFailed = "\u83b7\u53d6\u767e\u5ea6 OCR access_token \u5931\u8d25\uff1a";
+    public const string OcrRequestFailed = "\u767e\u5ea6 OCR \u8bc6\u522b\u5931\u8d25\uff1a";
+    public const string OcrResponseInvalid = "\u767e\u5ea6 OCR \u8fd4\u56de\u7684 JSON \u683c\u5f0f\u65e0\u6cd5\u89e3\u6790\u3002";
+    public const string OcrTranslateResponseInvalid = "\u8c37\u6b4c\u7ffb\u8bd1\u8fd4\u56de\u7684 JSON \u683c\u5f0f\u65e0\u6cd5\u89e3\u6790\u3002";
     public const string Undo = "\u64a4\u9500";
     public const string Fit = "\u9002\u5408\u7a97\u53e3";
     public const string Pin = "\u7f6e\u9876";
@@ -84,7 +131,6 @@ internal static class UiText
     public const string NoImageFound = "\u672a\u627e\u5230\u56fe\u7247\u3002\u8bf7\u5148\u590d\u5236\u4e00\u5f20\u56fe\u7247\uff0c\u6216\u5c06\u56fe\u7247\u8def\u5f84\u4f5c\u4e3a\u7b2c\u4e00\u4e2a\u53c2\u6570\u4f20\u5165\u3002";
     public const string ImagePathIsEmpty = "\u56fe\u7247\u8def\u5f84\u4e0d\u80fd\u4e3a\u7a7a\u3002";
     public const string ImageFileDoesNotExist = "\u627e\u4e0d\u5230\u56fe\u7247\u6587\u4ef6\uff1a";
-    public const string OutputDirectoryArgumentRequired = "--output-dir \u9700\u8981\u6307\u5b9a\u4fdd\u5b58\u76ee\u5f55\u8def\u5f84\u3002";
     public const string GpuFatal = "GPU/Direct2D \u6e32\u67d3\u5931\u8d25\uff0c\u65e0\u6cd5\u7ee7\u7eed\u8fd0\u884c\u3002";
 }
 
@@ -128,6 +174,9 @@ internal sealed class SettingsOverlayState
     public bool ToolOptionsClosing;
     public float ToolOptionsOpacity;
     public string OutputDirectory;
+    public string ScreenshotDirectory;
+    public bool AutoStartEnabled;
+    public bool GlobalHotkeyEnabled = true;
     public string Tooltip;
     public GpuPoint TooltipPoint;
 }

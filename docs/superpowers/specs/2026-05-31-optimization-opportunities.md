@@ -13,7 +13,7 @@ Current measured and structural signals:
 - Source size: about 282.5 KB across 11 `.cs` files.
 - Largest files: `GpuAnnotatorWindow.cs` 2796 lines, `GpuRenderer.cs` 1078 lines, `NativeApi.cs` 1016 lines, `AnnotatorApp.cs` 858 lines, `ClipboardBridge.cs` 538 lines.
 
-Already landed first-pass wins include lazy renderer creation on first paint, launch-to-first-frame logging, input-to-frame logging, `ClipboardBridge` extraction, inline and static text layout caching, shared DirectWrite factory reuse, cached hover cursor lookup, reduced per-tile mosaic overlay work, per-process clipboard temp reuse, clipboard startup smoke coverage, and memory-DC benchmark smoke coverage. The remaining items below are the next optimization frontier rather than a snapshot of untouched code.
+Already landed first-pass wins include lazy renderer creation on first paint, `ClipboardBridge` extraction, inline and static text layout caching, shared DirectWrite factory reuse, cached hover cursor lookup, reduced per-tile mosaic overlay work, per-process clipboard temp reuse, clipboard startup smoke coverage, and memory-DC benchmark smoke coverage. The remaining items below are the next optimization frontier rather than a snapshot of untouched code.
 
 ## Priority 1: Reduce startup work on the UI thread
 
@@ -229,13 +229,12 @@ The repo does not currently depend on external libraries, so this is about syste
 
 ### Current state
 
-There is now a render benchmark, launch-to-first-frame logging, input-to-frame logging, a benchmark smoke self-test, a clipboard startup smoke test, and a broad self-test suite, but there are no stored golden screenshots or enforced latency thresholds for input interactions.
+There is now a benchmark smoke self-test, a clipboard startup smoke test, and a broad self-test suite, but there are no stored golden screenshots or enforced latency thresholds for input interactions.
 
 ### Proposed improvement
 
 - Add golden image checks for toolbar, settings overlay, text editing, and arrow/selection states.
-- Persist or threshold the launch-to-first-frame metric once enough machine-local samples exist.
-- Persist or threshold the input-to-frame metric once enough machine-local samples exist.
+- Add dedicated startup and input latency checks if those metrics become release criteria.
 
 ### Expected benefit
 
@@ -253,7 +252,7 @@ Medium.
 
 ### Quantitative angle
 
-The launch-to-first-frame and input-to-frame metrics now complement the existing render benchmark; persisted thresholds would make the current 7.0 to 16.1 ms steady-state P95 frame numbers more actionable.
+Historical render measurements are useful for trend spotting; persisted thresholds would make the current 7.0 to 16.1 ms steady-state P95 frame numbers more actionable.
 
 ## Out of scope today
 

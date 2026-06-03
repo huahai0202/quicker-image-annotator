@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -14,6 +13,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         ToolbarCommand.ToolPen,
         ToolbarCommand.ToolMosaic,
         ToolbarCommand.ToolText,
+        ToolbarCommand.Ocr,
         ToolbarCommand.Undo,
         ToolbarCommand.Clear,
         ToolbarCommand.Fit,
@@ -26,6 +26,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private const string WindowClassName = "QuickerGpuOnlyAnnotatorWindow";
     private const int MinWindowWidth = 720;
     private const int MinWindowHeight = 520;
+    private const int InitialWindowScreenMargin = 80;
     private const float MinAnnotationExtent = 2f;
     private const float SelectionHitTolerancePixels = 8f;
     private const float MoveSampleThresholdPixels = 0.5f;
@@ -34,6 +35,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private const uint ToolOptionsAnimationFrameMilliseconds = 16;
     private const float ToolOptionsAnimationMilliseconds = 150f;
     private const uint TextCaretBlinkMilliseconds = 530;
+    private const int WmOcrComplete = Win32Api.WmApp + 61;
     private static readonly IntPtr ToolOptionsTimerId = new IntPtr(101);
     private static readonly IntPtr ToolOptionsAnimationTimerId = new IntPtr(102);
     private static readonly IntPtr TextCaretTimerId = new IntPtr(103);
@@ -45,8 +47,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private const int MaxConsecutiveRenderFailures = 3;
     private readonly WicImageDocument image;
     private readonly string imagePath;
+    private readonly bool preferActualSize;
     private string outputDirectory;
-    private long startupTimestamp;
+    private string screenshotDirectory;
     private readonly List<AnnotationItem> items = new List<AnnotationItem>();
     private readonly Stack<AnnotationUndoAction> undoStack = new Stack<AnnotationUndoAction>();
     private GpuRenderer renderer;
@@ -99,16 +102,19 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     private int consecutiveRenderFailures;
     private bool fatalErrorShown;
     private bool disposed;
-    private long inputToFrameTimestamp;
+    private bool initialViewApplied;
     private bool firstFrameFadeStarted;
+    private bool ocrRunning;
+    private int ocrRequestVersion;
     private byte firstFrameOpacity = 255;
 
-    public GpuAnnotatorWindow(string imagePath, WicImageDocument image, string outputDirectory, long startupTimestamp)
+    public GpuAnnotatorWindow(string imagePath, WicImageDocument image, string outputDirectory, string screenshotDirectory, bool preferActualSize)
     {
         this.imagePath = imagePath;
         this.image = image;
         this.outputDirectory = outputDirectory;
-        this.startupTimestamp = startupTimestamp;
+        this.screenshotDirectory = screenshotDirectory;
+        this.preferActualSize = preferActualSize;
     }
 
     public int Run()
@@ -154,11 +160,11 @@ internal sealed class GpuAnnotatorWindow : IDisposable
     public static GpuRect GetToolbarButtonRect(int index)
     {
         int x = AppStyles.ToolbarStartX + index * (AppStyles.ToolbarButtonSide + AppStyles.ToolbarButtonGap);
-        if (index >= 6)
+        if (index >= 7)
         {
             x += 25;
         }
-        if (index >= 11)
+        if (index >= 12)
         {
             x += 25;
         }
@@ -289,6 +295,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                     inlineComposing = false;
                     RequestPaint();
                     return IntPtr.Zero;
+                case WmOcrComplete:
+                    CompleteOcr(wParam);
+                    return IntPtr.Zero;
                 case Win32Api.WmClose:
                     Win32Api.DestroyWindow(hwnd);
                     return IntPtr.Zero;
@@ -321,21 +330,12 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             try
             {
                 settingsOverlay.TopMost = topMost;
+                ApplyInitialView(width, height);
                 if (renderer == null)
                 {
                     renderer = GpuRenderer.CreateForWindow(image);
                 }
                 renderer.RenderToHdc(hdc, width, height, GetView(width, height), items, GetPreviewItem(), selectedIndex, true, currentTool, stroke, strokeWidth, settingsOverlay);
-                if (startupTimestamp != 0)
-                {
-                    RenderPerformanceProbe.RecordSince(RenderPerformanceProbe.LaunchToFirstFrame, startupTimestamp);
-                    startupTimestamp = 0;
-                }
-                if (inputToFrameTimestamp != 0)
-                {
-                    RenderPerformanceProbe.RecordSince(RenderPerformanceProbe.InputToFrame, inputToFrameTimestamp);
-                    inputToFrameTimestamp = 0;
-                }
                 consecutiveRenderFailures = 0;
                 frameRendered = true;
             }
@@ -356,7 +356,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseDown(int x, int y)
     {
-        MarkInputToFrame();
         if (settingsOverlay.Visible)
         {
             HandleSettingsOverlayClick(x, y);
@@ -434,7 +433,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseDoubleClick(int x, int y)
     {
-        MarkInputToFrame();
         if (settingsOverlay.Visible || y < AppStyles.ToolbarHeight)
         {
             return;
@@ -520,7 +518,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseUp(int x, int y)
     {
-        MarkInputToFrame();
         GpuPoint clientPoint = new GpuPoint(x, y);
         GpuRect view = GetView();
         GpuPoint imagePoint = ToImagePoint(clientPoint, view);
@@ -629,7 +626,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void MouseWheel(int delta, IntPtr lParam)
     {
-        MarkInputToFrame();
         Win32Api.NativePoint p = new Win32Api.NativePoint();
         p.x = Win32Api.GetX(lParam);
         p.y = Win32Api.GetY(lParam);
@@ -645,12 +641,13 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void KeyDown(int key)
     {
-        MarkInputToFrame();
         bool ctrl = (Win32Api.GetKeyState(Win32Api.VkControl) & 0x8000) != 0;
         bool shift = (Win32Api.GetKeyState(Win32Api.VkShift) & 0x8000) != 0;
-        if (ctrl && key == Win32Api.VkS)
+        ToolbarCommand shortcutCommand;
+        if (AppShortcuts.TryGetToolbarCommand(key, ctrl, shift, out shortcutCommand) &&
+            (!textEditing || shortcutCommand == ToolbarCommand.Save))
         {
-            SaveAndClose();
+            ExecuteCommand(shortcutCommand);
             return;
         }
         if (textEditing && HandleInlineTextKeyDown(key, ctrl, shift))
@@ -686,7 +683,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void CharInput(char ch)
     {
-        MarkInputToFrame();
         if (!textEditing)
         {
             return;
@@ -699,7 +695,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void ImeComposition(IntPtr wParam, IntPtr lParam)
     {
-        MarkInputToFrame();
         IntPtr context = Win32Api.ImmGetContext(hwnd);
         if (context == IntPtr.Zero)
         {
@@ -1212,7 +1207,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private void ExecuteCommand(ToolbarCommand command)
     {
-        MarkInputToFrame();
         settingsOverlay.Tooltip = null;
         bool toolChanged = false;
         switch (command)
@@ -1241,6 +1235,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 currentTool = ToolMode.Text;
                 toolChanged = true;
                 break;
+            case ToolbarCommand.Ocr:
+                RunOcr();
+                break;
             case ToolbarCommand.Undo:
                 UndoAnnotationAction();
                 break;
@@ -1259,8 +1256,9 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 break;
             case ToolbarCommand.Settings:
                 HideToolOptions();
-                settingsOverlay.Visible = true;
-                settingsOverlay.OutputDirectory = outputDirectory ?? string.Empty;
+                settingsOverlay.Visible = false;
+                SettingsWindow.Run(hwnd);
+                ReloadSettingsForCurrentWindow();
                 break;
             case ToolbarCommand.Cancel:
                 Win32Api.DestroyWindow(hwnd);
@@ -1312,7 +1310,7 @@ internal sealed class GpuAnnotatorWindow : IDisposable
                 ShowToolOptionsTemporarily();
                 return;
             }
-            string tooltip = TooltipForCommand(command.Value);
+            string tooltip = AppShortcuts.GetTooltip(command.Value);
             GpuPoint point = new GpuPoint(x, y);
             if (!string.Equals(settingsOverlay.Tooltip, tooltip, StringComparison.Ordinal) ||
                 settingsOverlay.TooltipPoint.X != point.X ||
@@ -1325,41 +1323,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
             return;
         }
         ClearTooltip();
-    }
-
-    private static string TooltipForCommand(ToolbarCommand command)
-    {
-        switch (command)
-        {
-            case ToolbarCommand.ToolRect:
-                return UiText.Rect;
-            case ToolbarCommand.ToolEllipse:
-                return UiText.Ellipse;
-            case ToolbarCommand.ToolArrow:
-                return UiText.Arrow;
-            case ToolbarCommand.ToolPen:
-                return UiText.Pen;
-            case ToolbarCommand.ToolMosaic:
-                return UiText.Mosaic;
-            case ToolbarCommand.ToolText:
-                return UiText.Text;
-            case ToolbarCommand.Undo:
-                return UiText.Undo;
-            case ToolbarCommand.Clear:
-                return UiText.Clear;
-            case ToolbarCommand.Fit:
-                return UiText.Fit;
-            case ToolbarCommand.Pin:
-                return UiText.Pin;
-            case ToolbarCommand.Settings:
-                return UiText.Settings;
-            case ToolbarCommand.Cancel:
-                return UiText.Cancel;
-            case ToolbarCommand.Save:
-                return UiText.Save;
-            default:
-                return string.Empty;
-        }
     }
 
     private void ClearTooltip()
@@ -1780,19 +1743,63 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         SettingsOverlayCommand command = HitSettingsOverlay(panel, point);
         switch (command)
         {
-            case SettingsOverlayCommand.Browse:
+            case SettingsOverlayCommand.BrowseOutput:
                 string selected = ShellDialogs.BrowseForFolder(hwnd, UiText.SelectOutputDirectory);
                 if (!string.IsNullOrEmpty(selected))
                 {
                     settingsOverlay.OutputDirectory = selected;
                 }
                 break;
-            case SettingsOverlayCommand.Clear:
+            case SettingsOverlayCommand.ClearOutput:
                 settingsOverlay.OutputDirectory = null;
+                break;
+            case SettingsOverlayCommand.BrowseScreenshot:
+                string screenshotSelected = ShellDialogs.BrowseForFolder(hwnd, UiText.SelectScreenshotDirectory);
+                if (!string.IsNullOrEmpty(screenshotSelected))
+                {
+                    settingsOverlay.ScreenshotDirectory = screenshotSelected;
+                }
+                break;
+            case SettingsOverlayCommand.ClearScreenshot:
+                settingsOverlay.ScreenshotDirectory = null;
+                break;
+            case SettingsOverlayCommand.ToggleAutoStart:
+                settingsOverlay.AutoStartEnabled = !settingsOverlay.AutoStartEnabled;
+                break;
+            case SettingsOverlayCommand.ToggleGlobalHotkey:
+                settingsOverlay.GlobalHotkeyEnabled = !settingsOverlay.GlobalHotkeyEnabled;
                 break;
             case SettingsOverlayCommand.Save:
                 outputDirectory = AppSettingsStore.NormalizeDirectory(settingsOverlay.OutputDirectory);
-                AppSettingsStore.Save(new AppSettings { OutputDirectory = outputDirectory });
+                screenshotDirectory = AppSettingsStore.NormalizeDirectory(settingsOverlay.ScreenshotDirectory);
+                try
+                {
+                    AppFeatures.ApplyAutoStart(settingsOverlay.AutoStartEnabled);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("Failed to update startup setting.", ex);
+                    Win32Api.MessageBoxUnicode(hwnd, UiText.StartupSettingFailed + Environment.NewLine + ex.Message, UiText.AppName, Win32Api.MbOk | Win32Api.MbIconError);
+                    break;
+                }
+                AppSettings existingSettings = AppSettingsStore.Load();
+                existingSettings.OutputDirectory = outputDirectory;
+                existingSettings.ScreenshotDirectory = screenshotDirectory;
+                existingSettings.AutoStartEnabled = settingsOverlay.AutoStartEnabled;
+                existingSettings.GlobalHotkeyEnabled = settingsOverlay.GlobalHotkeyEnabled;
+                existingSettings.GlobalHotkeyModifiers = AppFeatures.GetGlobalHotkeyModifiers(existingSettings);
+                existingSettings.GlobalHotkeyKey = AppFeatures.GetGlobalHotkeyKey(existingSettings);
+                AppSettingsStore.Save(existingSettings);
+                string error;
+                if (!AppFeatures.TrySyncBackgroundHotkeyAgent(settingsOverlay.GlobalHotkeyEnabled, out error))
+                {
+                    string message = settingsOverlay.GlobalHotkeyEnabled ? UiText.GlobalHotkeyStartFailed : UiText.GlobalHotkeyStopFailed;
+                    if (!string.IsNullOrEmpty(error))
+                    {
+                        message += Environment.NewLine + error;
+                    }
+                    Win32Api.MessageBoxUnicode(hwnd, message, UiText.AppName, Win32Api.MbOk | Win32Api.MbIconWarning);
+                }
                 settingsOverlay.Visible = false;
                 break;
             case SettingsOverlayCommand.Cancel:
@@ -1810,13 +1817,29 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private static SettingsOverlayCommand HitSettingsOverlay(GpuRect panel, GpuPoint point)
     {
-        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.Browse).Contains(point))
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.BrowseOutput).Contains(point))
         {
-            return SettingsOverlayCommand.Browse;
+            return SettingsOverlayCommand.BrowseOutput;
         }
-        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.Clear).Contains(point))
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.ClearOutput).Contains(point))
         {
-            return SettingsOverlayCommand.Clear;
+            return SettingsOverlayCommand.ClearOutput;
+        }
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.BrowseScreenshot).Contains(point))
+        {
+            return SettingsOverlayCommand.BrowseScreenshot;
+        }
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.ClearScreenshot).Contains(point))
+        {
+            return SettingsOverlayCommand.ClearScreenshot;
+        }
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.ToggleAutoStart).Contains(point))
+        {
+            return SettingsOverlayCommand.ToggleAutoStart;
+        }
+        if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.ToggleGlobalHotkey).Contains(point))
+        {
+            return SettingsOverlayCommand.ToggleGlobalHotkey;
         }
         if (GpuRenderer.GetSettingsButtonRect(panel, SettingsOverlayCommand.Save).Contains(point))
         {
@@ -2128,6 +2151,13 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         RequestPaint();
     }
 
+    private void ReloadSettingsForCurrentWindow()
+    {
+        AppSettings settings = AppSettingsStore.Load();
+        outputDirectory = settings.OutputDirectory;
+        screenshotDirectory = settings.ScreenshotDirectory;
+    }
+
     private void SelectAnnotation(int index)
     {
         if (index < 0 || index >= items.Count)
@@ -2398,11 +2428,74 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         return Inflate(bounds, pad, pad);
     }
 
+    private void RunOcr()
+    {
+        if (ocrRunning)
+        {
+            return;
+        }
+
+        CommitTextIfNeeded();
+        AppSettings settings = AppSettingsStore.Load();
+        if (string.IsNullOrWhiteSpace(settings.BaiduOcrApiKey) || string.IsNullOrWhiteSpace(settings.BaiduOcrSecretKey))
+        {
+            Win32Api.MessageBoxUnicode(hwnd, UiText.OcrCredentialsMissing, UiText.OcrTitle, Win32Api.MbOk | Win32Api.MbIconWarning);
+            AppFeatures.StartSettingsWindow();
+            return;
+        }
+
+        try
+        {
+            int version = ++ocrRequestVersion;
+            OcrController.OcrRequest request = OcrController.CreateRequest(image, items, selectedIndex, settings, version);
+            ocrRunning = true;
+            Win32Api.SetWindowTextUnicode(hwnd, UiText.OcrRunning);
+            OcrController.BeginRecognize(hwnd, WmOcrComplete, request);
+        }
+        catch (Exception ex)
+        {
+            ocrRunning = false;
+            Win32Api.SetWindowTextUnicode(hwnd, UiText.AppName);
+            AppLog.Error("OCR failed.", ex);
+            Win32Api.MessageBoxUnicode(hwnd, ex.Message, UiText.OcrTitle, Win32Api.MbOk | Win32Api.MbIconError);
+        }
+    }
+
+    private void CompleteOcr(IntPtr resultHandle)
+    {
+        OcrController.OcrAsyncResult async = OcrController.TakeResult(resultHandle);
+        if (async == null || async.Version != ocrRequestVersion)
+        {
+            return;
+        }
+
+        ocrRunning = false;
+        Win32Api.SetWindowTextUnicode(hwnd, UiText.AppName);
+        if (async.Error != null)
+        {
+            AppLog.Error("OCR failed.", async.Error);
+            Win32Api.MessageBoxUnicode(hwnd, async.Error.Message, UiText.OcrTitle, Win32Api.MbOk | Win32Api.MbIconError);
+            return;
+        }
+        if (async.Result == null)
+        {
+            return;
+        }
+
+        AppSettings settings = async.Settings ?? AppSettingsStore.Load();
+        OcrResultWindow.Show(hwnd, async.Result, settings.OcrLayout);
+    }
+
     private void SaveAndClose()
     {
         CommitTextIfNeeded();
-        string outputPath = GetAnnotatedOutputPath(imagePath, outputDirectory);
+        string targetDirectory = outputDirectory;
+        if (preferActualSize && !string.IsNullOrEmpty(screenshotDirectory))
+        {
+            targetDirectory = screenshotDirectory;
+        }
         byte[] pixels = GpuRenderer.RenderExport(image, items);
+        string outputPath = GetAnnotatedOutputPath(imagePath, targetDirectory);
         WicCodec.SavePixels(outputPath, image.Width, image.Height, pixels);
         ClipboardBridge.SetImage(hwnd, outputPath, image.Width, image.Height, pixels);
         Win32Api.DestroyWindow(hwnd);
@@ -2417,12 +2510,12 @@ internal sealed class GpuAnnotatorWindow : IDisposable
 
     private GpuRect GetView(int width, int height)
     {
-        float availableH = Math.Max(1f, height - AppStyles.ToolbarHeight);
-        float scale = Math.Min((float)width / image.Width, availableH / image.Height) * zoom;
-        float w = image.Width * scale;
-        float h = image.Height * scale;
-        float x = (width - w) / 2f + viewOffset.X;
-        float y = AppStyles.ToolbarHeight + (availableH - h) / 2f + viewOffset.Y;
+        float availableH = GetAvailableImageHeight(height);
+        float scale = GetFitScale(width, height) * zoom;
+        float w = RoundViewPixel(image.Width * scale);
+        float h = RoundViewPixel(image.Height * scale);
+        float x = RoundViewCoordinate((width - w) / 2f + viewOffset.X);
+        float y = RoundViewCoordinate(AppStyles.ToolbarHeight + (availableH - h) / 2f + viewOffset.Y);
         return new GpuRect(x, y, w, h);
     }
 
@@ -2449,11 +2542,56 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         InvalidateHoverCache();
     }
 
+    private void ApplyInitialView(int width, int height)
+    {
+        if (initialViewApplied)
+        {
+            return;
+        }
+        initialViewApplied = true;
+        if (!preferActualSize)
+        {
+            return;
+        }
+
+        float fitScale = GetFitScale(width, height);
+        if (fitScale > 0.001f)
+        {
+            zoom = Math.Max(0.05f, Math.Min(16f, 1f / fitScale));
+            viewOffset = GpuPoint.Empty;
+        }
+    }
+
+    private float GetFitScale(int width, int height)
+    {
+        float availableH = GetAvailableImageHeight(height);
+        return Math.Min((float)width / image.Width, availableH / image.Height);
+    }
+
+    private static float GetAvailableImageHeight(int height)
+    {
+        return Math.Max(1f, height - AppStyles.ToolbarHeight);
+    }
+
     private GpuExtent GetInitialWindowExtent()
     {
-        int width = Math.Max(MinWindowWidth, Math.Min(1400, image.Width + 60));
-        int height = Math.Max(MinWindowHeight, Math.Min(1000, image.Height + AppStyles.ToolbarHeight + 60));
+        int screenWidth = Math.Max(MinWindowWidth, Win32Api.GetSystemMetrics(Win32Api.SmCxScreen));
+        int screenHeight = Math.Max(MinWindowHeight, Win32Api.GetSystemMetrics(Win32Api.SmCyScreen));
+        int maxWidth = Math.Max(MinWindowWidth, screenWidth - InitialWindowScreenMargin);
+        int maxHeight = Math.Max(MinWindowHeight, screenHeight - InitialWindowScreenMargin);
+        int width = Math.Max(MinWindowWidth, Math.Min(maxWidth, image.Width + 60));
+        int height = Math.Max(MinWindowHeight, Math.Min(maxHeight, image.Height + AppStyles.ToolbarHeight + 60));
         return new GpuExtent(width, height);
+    }
+
+    private static float RoundViewPixel(float value)
+    {
+        return Math.Max(1f, (float)Math.Round(value));
+    }
+
+    private static float RoundViewCoordinate(float value)
+    {
+        return (float)Math.Round(value);
     }
 
     private void RequestPaint()
@@ -2462,11 +2600,6 @@ internal sealed class GpuAnnotatorWindow : IDisposable
         {
             Win32Api.InvalidateRect(hwnd, IntPtr.Zero, false);
         }
-    }
-
-    private void MarkInputToFrame()
-    {
-        inputToFrameTimestamp = Stopwatch.GetTimestamp();
     }
 
     private void WarmUpRenderer()

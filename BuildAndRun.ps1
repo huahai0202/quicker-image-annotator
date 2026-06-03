@@ -57,7 +57,9 @@ if ($needsBuild) {
         "/optimize+",
         "/codepage:65001",
         "/out:$exe",
-        "/r:System.dll"
+        "/r:System.dll",
+        "/r:System.Security.dll",
+        "/r:System.Web.Extensions.dll"
     )
     if (Test-Path -LiteralPath $icon) {
         $compileArgs += "/win32icon:$icon"

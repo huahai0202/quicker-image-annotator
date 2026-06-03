@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 internal static class ComUtil
 {
@@ -45,13 +46,20 @@ internal static class Win32Api
 {
     public const int CwUseDefault = unchecked((int)0x80000000);
     public const int SwShow = 5;
+    public const int WsPopup = unchecked((int)0x80000000);
     public const int WsExLayered = 0x00080000;
+    public const int WsExTopMost = 0x00000008;
+    public const int WsExToolWindow = 0x00000080;
     public const int WmDestroy = 0x0002;
+    public const int WmNull = 0x0000;
     public const int WmPaint = 0x000F;
     public const int WmClose = 0x0010;
+    public const int WmCommand = 0x0111;
     public const int WmTimer = 0x0113;
     public const int WmEraseBkgnd = 0x0014;
     public const int WmSetCursor = 0x0020;
+    public const int WmHotkey = 0x0312;
+    public const int WmApp = 0x8000;
     public const int WmKeyDown = 0x0100;
     public const int WmChar = 0x0102;
     public const int WmMouseMove = 0x0200;
@@ -71,6 +79,7 @@ internal static class Win32Api
     public const int CsVRedraw = 0x0001;
     public const int CsDblClks = 0x0008;
     public const int VkEscape = 0x1B;
+    public const int VkSpace = 0x20;
     public const int VkDelete = 0x2E;
     public const int VkBack = 0x08;
     public const int VkReturn = 0x0D;
@@ -82,10 +91,26 @@ internal static class Win32Api
     public const int VkEnd = 0x23;
     public const int VkA = 0x41;
     public const int VkC = 0x43;
+    public const int VkD = 0x44;
+    public const int VkF = 0x46;
+    public const int VkO = 0x4F;
+    public const int VkP = 0x50;
     public const int VkV = 0x56;
     public const int VkX = 0x58;
     public const int VkZ = 0x5A;
     public const int VkS = 0x53;
+    public const int VkD0 = 0x30;
+    public const int VkD1 = 0x31;
+    public const int VkD2 = 0x32;
+    public const int VkD3 = 0x33;
+    public const int VkD4 = 0x34;
+    public const int VkD5 = 0x35;
+    public const int VkD6 = 0x36;
+    public const int VkD7 = 0x37;
+    public const int VkD8 = 0x38;
+    public const int VkD9 = 0x39;
+    public const int VkF1 = 0x70;
+    public const int VkF12 = 0x7B;
     public const int GwlExStyle = -20;
     public const int GwlpUserData = -21;
     public const int IdcArrow = 32512;
@@ -99,8 +124,19 @@ internal static class Win32Api
     public const int WmSetIcon = 0x0080;
     public const int IconSmall = 0;
     public const int IconBig = 1;
+    public const int IdiApplication = 32512;
     public const uint ImageIcon = 1;
     public const uint LrLoadFromFile = 0x00000010;
+    public const uint NimAdd = 0x00000000;
+    public const uint NimDelete = 0x00000002;
+    public const uint NifMessage = 0x00000001;
+    public const uint NifIcon = 0x00000002;
+    public const uint NifTip = 0x00000004;
+    public const uint MfString = 0x00000000;
+    public const uint MfSeparator = 0x00000800;
+    public const uint TpmRightButton = 0x0002;
+    public const uint TpmReturnCmd = 0x0100;
+    public const uint TpmNonotify = 0x0080;
     public const uint LwaAlpha = 0x00000002;
     public const uint MbIconError = 0x00000010;
     public const uint MbIconWarning = 0x00000030;
@@ -117,6 +153,69 @@ internal static class Win32Api
     public const uint GmemZeroinit = 0x0040;
     public const uint GenericRead = 0x80000000;
     public const uint GenericWrite = 0x40000000;
+    public const int SmCxScreen = 0;
+    public const int SmCyScreen = 1;
+    public const int SmXVirtualScreen = 76;
+    public const int SmYVirtualScreen = 77;
+    public const int SmCxVirtualScreen = 78;
+    public const int SmCyVirtualScreen = 79;
+    public const int DibRgbColors = 0;
+    public const uint DibRgb = 0;
+    public const uint RasterCopy = 0x00CC0020;
+    public const uint RasterCaptureLayered = 0x40000000;
+    public const int PenStyleSolid = 0;
+    public const int StockNullBrush = 5;
+    public const int StockWhiteBrush = 0;
+    public const int TransparentBkMode = 1;
+    public const int LogPixelsY = 90;
+    public const int FontWeightRegular = 400;
+    public const int FontWeightSemiBold = 600;
+    public const int FontWeightBold = 700;
+    public const uint DefaultCharSet = 1;
+    public const uint OutDefaultPrecision = 0;
+    public const uint ClipDefaultPrecision = 0;
+    public const uint ClearTypeQuality = 5;
+    public const uint DefaultPitch = 0;
+    public const int GdiPlusOk = 0;
+    public const int GdiPlusUnitPixel = 2;
+    public const int GdiPlusFillModeAlternate = 0;
+    public const int GdiPlusSmoothingModeAntiAlias = 4;
+    public const int GdiPlusPixelOffsetModeHalf = 4;
+    public const uint DtLeft = 0x00000000;
+    public const uint DtCenter = 0x00000001;
+    public const uint DtVCenter = 0x00000004;
+    public const uint DtSingleLine = 0x00000020;
+    public const uint DtEndEllipsis = 0x00008000;
+    public const byte AcSrcOver = 0;
+    public const int DwmwaExtendedFrameBounds = 9;
+    public const int DwmwaCloaked = 14;
+    public const uint HotkeyModAlt = 0x0001;
+    public const uint HotkeyModControl = 0x0002;
+    public const uint HotkeyModShift = 0x0004;
+    public const int WsChild = 0x40000000;
+    public const int WsVisible = 0x10000000;
+    public const int WsVScroll = 0x00200000;
+    public const int WsHScroll = 0x00100000;
+    public const int WsTabStop = 0x00010000;
+    public const int WsBorder = 0x00800000;
+    public const int EsMultiline = 0x0004;
+    public const int EsPassword = 0x0020;
+    public const int EsAutoHScroll = 0x0080;
+    public const int EsReadonly = 0x0800;
+    public const int EsWantReturn = 0x1000;
+    public const int BsPushButton = 0x00000000;
+    public const int BsAutoCheckBox = 0x00000003;
+    public const int BmGetCheck = 0x00F0;
+    public const int BmSetCheck = 0x00F1;
+    public const int BstUnchecked = 0;
+    public const int BstChecked = 1;
+    public const int WmSetFont = 0x0030;
+    public const int WmUser = 0x0400;
+    public const int HkmSetHotkey = WmUser + 1;
+    public const int HkmGetHotkey = WmUser + 2;
+    public const byte HotkeyfShift = 0x01;
+    public const byte HotkeyfControl = 0x02;
+    public const byte HotkeyfAlt = 0x04;
     public static readonly IntPtr HwndTopMost = new IntPtr(-1);
     public static readonly IntPtr HwndNoTopMost = new IntPtr(-2);
     public const uint SwpNoMove = 0x0002;
@@ -124,8 +223,10 @@ internal static class Win32Api
     public const uint SwpNoZOrder = 0x0004;
     public const uint SwpNoActivate = 0x0010;
     public const uint SwpFrameChanged = 0x0020;
+    private static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new IntPtr(-4);
 
     public delegate IntPtr WindowProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct WndClassEx
@@ -144,6 +245,26 @@ internal static class Win32Api
         [MarshalAs(UnmanagedType.LPWStr)]
         public string lpszClassName;
         public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NotifyIconData
+    {
+        public uint cbSize;
+        public IntPtr hWnd;
+        public uint uID;
+        public uint uFlags;
+        public uint uCallbackMessage;
+        public IntPtr hIcon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string szTip;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct InitCommonControlsExData
+    {
+        public int dwSize;
+        public int dwICC;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -258,6 +379,47 @@ internal static class Win32Api
         public int iPaddedBorderWidth;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DibHeader
+    {
+        public uint size;
+        public int width;
+        public int height;
+        public ushort planes;
+        public ushort bitCount;
+        public uint compression;
+        public uint imageSize;
+        public int xPelsPerMeter;
+        public int yPelsPerMeter;
+        public uint clrUsed;
+        public uint clrImportant;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DibInfo
+    {
+        public DibHeader header;
+        public uint colors;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BlendFunction
+    {
+        public byte blendOp;
+        public byte blendFlags;
+        public byte sourceConstantAlpha;
+        public byte alphaFormat;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GdiplusStartupInput
+    {
+        public uint GdiplusVersion;
+        public IntPtr DebugEventCallback;
+        public int SuppressBackgroundThread;
+        public int SuppressExternalCodecs;
+    }
+
     [DllImport("user32.dll", EntryPoint = "RegisterClassExW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     public static extern ushort RegisterClassEx(ref WndClassEx lpwcx);
 
@@ -283,7 +445,21 @@ internal static class Win32Api
     public static extern bool UpdateWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
-    public static extern bool SetProcessDPIAware();
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    public static void ConfigureProcessDpiAwareness()
+    {
+        SetProcessDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2);
+    }
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetDC(IntPtr hWnd);
@@ -306,6 +482,130 @@ internal static class Win32Api
     [DllImport("gdi32.dll")]
     public static extern bool DeleteDC(IntPtr hdc);
 
+    [DllImport("gdi32.dll")]
+    public static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int width, int height, IntPtr hdcSource, int xSource, int ySource, uint rop);
+
+    [DllImport("gdi32.dll")]
+    public static extern int GetDIBits(IntPtr hdc, IntPtr surface, uint start, uint lines, byte[] bits, ref DibInfo info, uint usage);
+
+    [DllImport("gdi32.dll")]
+    public static extern int SetDIBitsToDevice(IntPtr hdc, int xDest, int yDest, uint width, uint height, int xSrc, int ySrc, uint startScan, uint scanLines, byte[] bits, ref DibInfo info, uint usage);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateSolidBrush(uint color);
+
+    [DllImport("gdi32.dll", EntryPoint = "CreateFontW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern IntPtr CreateFont(
+        int height,
+        int width,
+        int escapement,
+        int orientation,
+        int weight,
+        uint italic,
+        uint underline,
+        uint strikeOut,
+        uint charSet,
+        uint outputPrecision,
+        uint clipPrecision,
+        uint quality,
+        uint pitchAndFamily,
+        [MarshalAs(UnmanagedType.LPWStr)] string faceName);
+
+    [DllImport("gdi32.dll")]
+    public static extern int GetDeviceCaps(IntPtr hdc, int index);
+
+    [DllImport("kernel32.dll")]
+    public static extern int MulDiv(int number, int numerator, int denominator);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdiplusStartup(out IntPtr token, ref GdiplusStartupInput input, IntPtr output);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern void GdiplusShutdown(IntPtr token);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipCreateFromHDC(IntPtr hdc, out IntPtr graphics);
+
+    [DllImport("gdiplus.dll", EntryPoint = "GdipDelete" + "Gra" + "phics", ExactSpelling = true)]
+    public static extern int GdipDeleteSurface(IntPtr graphics);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipSetSmoothingMode(IntPtr graphics, int smoothingMode);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipSetPixelOffsetMode(IntPtr graphics, int pixelOffsetMode);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipCreatePath(int brushMode, out IntPtr path);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipDeletePath(IntPtr path);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipAddPathArc(IntPtr path, float x, float y, float width, float height, float startAngle, float sweepAngle);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipAddPathLine(IntPtr path, float x1, float y1, float x2, float y2);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipClosePathFigure(IntPtr path);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipCreateSolidFill(int color, out IntPtr brush);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipDeleteBrush(IntPtr brush);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipCreatePen1(int color, float width, int unit, out IntPtr pen);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipDeletePen(IntPtr pen);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipFillPath(IntPtr graphics, IntPtr brush, IntPtr path);
+
+    [DllImport("gdiplus.dll", ExactSpelling = true)]
+    public static extern int GdipDrawPath(IntPtr graphics, IntPtr pen, IntPtr path);
+
+    [DllImport("user32.dll")]
+    public static extern int FillRect(IntPtr hdc, ref NativeRect rect, IntPtr brush);
+
+    [DllImport("gdi32.dll")]
+    public static extern uint SetTextColor(IntPtr hdc, uint color);
+
+    [DllImport("gdi32.dll")]
+    public static extern int SetBkMode(IntPtr hdc, int mode);
+
+    [DllImport("user32.dll", EntryPoint = "DrawTextW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern int DrawText(IntPtr hdc, [MarshalAs(UnmanagedType.LPWStr)] string text, int count, ref NativeRect rect, uint format);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreatePen(int style, int width, uint color);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool Rectangle(IntPtr hdc, int left, int top, int right, int bottom);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool RoundRect(IntPtr hdc, int left, int top, int right, int bottom, int width, int height);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr GetStockObject(int index);
+
+    [DllImport("msimg32.dll")]
+    public static extern bool AlphaBlend(
+        IntPtr hdcDest,
+        int xOriginDest,
+        int yOriginDest,
+        int widthDest,
+        int heightDest,
+        IntPtr hdcSrc,
+        int xOriginSrc,
+        int yOriginSrc,
+        int widthSrc,
+        int heightSrc,
+        BlendFunction blendFunction);
+
     [DllImport("user32.dll")]
     public static extern bool GetMessage(out Msg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
@@ -317,6 +617,15 @@ internal static class Win32Api
 
     [DllImport("user32.dll")]
     public static extern void PostQuitMessage(int nExitCode);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
     [DllImport("user32.dll")]
     public static extern bool DestroyWindow(IntPtr hWnd);
@@ -336,14 +645,50 @@ internal static class Win32Api
     [DllImport("user32.dll")]
     public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
 
+    [DllImport("user32.dll", EntryPoint = "InvalidateRect")]
+    public static extern bool InvalidateRectRef(IntPtr hWnd, ref NativeRect lpRect, bool bErase);
+
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hWnd, ref NativePoint lpPoint);
 
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out NativePoint lpPoint);
 
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
+
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    public static extern int DwmGetWindowRectAttribute(IntPtr hwnd, int attribute, out NativeRect value, int size);
+
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    public static extern int DwmGetWindowIntAttribute(IntPtr hwnd, int attribute, out int value, int size);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDesktopWindow();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetClassNamePtr(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
     [DllImport("user32.dll", EntryPoint = "SetWindowTextW", ExactSpelling = true)]
     private static extern bool SetWindowTextPtr(IntPtr hWnd, IntPtr lpString);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowTextLengthW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetWindowTextLengthPtr(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowTextW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetWindowTextPtr(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll")]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
@@ -372,17 +717,38 @@ internal static class Win32Api
     [DllImport("user32.dll")]
     public static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
 
+    [DllImport("user32.dll", EntryPoint = "LoadIconW", SetLastError = true, ExactSpelling = true)]
+    public static extern IntPtr LoadIcon(IntPtr hInstance, IntPtr lpIconName);
+
     [DllImport("user32.dll", EntryPoint = "LoadImageW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     public static extern IntPtr LoadImage(IntPtr hInst, [MarshalAs(UnmanagedType.LPWStr)] string name, uint type, int cx, int cy, uint fuLoad);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+
     [DllImport("user32.dll")]
     public static extern IntPtr SetCursor(IntPtr hCursor);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr CreatePopupMenu();
+
+    [DllImport("user32.dll", EntryPoint = "AppendMenuW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    public static extern bool AppendMenu(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, [MarshalAs(UnmanagedType.LPWStr)] string lpNewItem);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool DestroyMenu(IntPtr hMenu);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
 
     [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("comctl32.dll", ExactSpelling = true)]
+    public static extern bool InitCommonControlsEx(ref InitCommonControlsExData data);
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
     private static extern IntPtr GetWindowLong32(IntPtr hWnd, int nIndex);
@@ -464,6 +830,9 @@ internal static class Win32Api
     [DllImport("shell32.dll", EntryPoint = "DragQueryFileW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     public static extern uint DragQueryFile(IntPtr hDrop, uint iFile, IntPtr lpszFile, uint cch);
 
+    [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    public static extern bool ShellNotifyIcon(uint dwMessage, ref NotifyIconData lpData);
+
     [DllImport("shell32.dll", EntryPoint = "SHBrowseForFolderW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     public static extern IntPtr SHBrowseForFolder(ref BrowseInfo lpbi);
 
@@ -501,6 +870,14 @@ internal static class Win32Api
         }
     }
 
+    public static string GetWindowTextUnicode(IntPtr hwnd)
+    {
+        int length = Math.Max(0, GetWindowTextLengthPtr(hwnd));
+        StringBuilder builder = new StringBuilder(length + 1);
+        GetWindowTextPtr(hwnd, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
     public static int MessageBoxUnicode(IntPtr hwnd, string text, string caption, uint type)
     {
         IntPtr textPointer = Marshal.StringToHGlobalUni(text ?? string.Empty);
@@ -514,6 +891,17 @@ internal static class Win32Api
             Marshal.FreeHGlobal(captionPointer);
             Marshal.FreeHGlobal(textPointer);
         }
+    }
+
+    public static string GetClassNameUnicode(IntPtr hwnd)
+    {
+        StringBuilder builder = new StringBuilder(256);
+        int length = GetClassNamePtr(hwnd, builder, builder.Capacity);
+        if (length <= 0)
+        {
+            return string.Empty;
+        }
+        return builder.ToString();
     }
 
     public static string GetSystemMessageFontName()

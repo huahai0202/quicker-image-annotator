@@ -2,41 +2,46 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Text;
 
 internal static class Program
 {
-    private const string OutputDirectoryEnvironmentVariable = "QUICKER_ANNOTATOR_OUTPUT_DIR";
-    private const string RenderProfileEnvironmentVariable = "QUICKER_ANNOTATOR_RENDER_PROFILE";
-    private const string RenderProfileLogEnvironmentVariable = "QUICKER_ANNOTATOR_RENDER_PROFILE_LOG";
-
     [STAThread]
     private static int Main(string[] args)
     {
         bool selfTest = args.Length > 0 && string.Equals(args[0], "-SelfTest", StringComparison.OrdinalIgnoreCase);
-        bool benchmark = IsBenchmarkRequested(args);
+        bool background = IsOptionPresent(args, "--background");
+        bool screenshot = IsOptionPresent(args, "--screenshot");
+        bool settingsWindow = IsOptionPresent(args, "--settings");
         try
         {
             Win32Api.CoInitializeEx(IntPtr.Zero, 2);
-            Win32Api.SetProcessDPIAware();
+            Win32Api.ConfigureProcessDpiAwareness();
             if (selfTest)
             {
                 RunSelfTest();
                 return 0;
             }
-            ConfigureRenderPerformanceProbe(args);
-            if (benchmark)
+            if (background)
             {
-                RunBenchmark(args);
-                return 0;
+                return BackgroundHotkeyAgent.Run();
+            }
+            AppSettings settings = AppSettingsStore.Load();
+            EnsureBackgroundHotkeyAgentForInteractiveLaunch(settings);
+            if (settingsWindow)
+            {
+                return SettingsWindow.Run();
             }
 
-            long startupTimestamp = Stopwatch.GetTimestamp();
-            string outputDirectory = GetConfiguredOutputDirectory(args);
+            string outputDirectory = settings.OutputDirectory;
+            string screenshotDirectory = settings.ScreenshotDirectory;
             string[] inputArgs = GetInputArgs(args);
-            string inputPath = GetInputImagePath(inputArgs);
+            string inputPath = screenshot ? ScreenCapture.CaptureSelectedScreenToTempFile() : GetInputImagePath(inputArgs);
+            if (string.IsNullOrEmpty(inputPath))
+            {
+                return 0;
+            }
             using (WicImageDocument image = WicImageDocument.Load(inputPath))
-            using (GpuAnnotatorWindow window = new GpuAnnotatorWindow(inputPath, image, outputDirectory, startupTimestamp))
+            using (GpuAnnotatorWindow window = new GpuAnnotatorWindow(inputPath, image, outputDirectory, screenshotDirectory, screenshot))
             {
                 return window.Run();
             }
@@ -44,7 +49,7 @@ internal static class Program
         catch (Exception ex)
         {
             AppLog.Error("Application failed.", ex);
-            if (selfTest || benchmark)
+            if (selfTest || background)
             {
                 WriteFailure(ex);
                 return 1;
@@ -54,9 +59,17 @@ internal static class Program
         }
         finally
         {
-            RenderPerformanceProbe.FlushSummary("shutdown");
             DWriteApi.ReleaseSharedFactory();
             Win32Api.CoUninitialize();
+        }
+    }
+
+    private static void EnsureBackgroundHotkeyAgentForInteractiveLaunch(AppSettings settings)
+    {
+        string error;
+        if (!AppFeatures.TryEnsureBackgroundHotkeyAgent(settings, out error) && !string.IsNullOrEmpty(error))
+        {
+            AppLog.Error("Failed to ensure background hotkey agent.", new InvalidOperationException(error));
         }
     }
 
@@ -81,71 +94,14 @@ internal static class Program
         throw new InvalidOperationException(UiText.NoImageFound);
     }
 
-    private static string GetConfiguredOutputDirectory(string[] args)
-    {
-        string outputDirectory = AppSettingsStore.Load().OutputDirectory;
-        string environmentDirectory = Environment.GetEnvironmentVariable(OutputDirectoryEnvironmentVariable);
-        if (!string.IsNullOrWhiteSpace(environmentDirectory))
-        {
-            outputDirectory = environmentDirectory;
-        }
-
-        for (int i = 0; i < args.Length; i++)
-        {
-            string arg = args[i];
-            string value;
-            if (TryGetInlineOption(arg, "--output-dir", out value))
-            {
-                outputDirectory = value;
-            }
-            else if (IsOption(arg, "--output-dir"))
-            {
-                if (i + 1 >= args.Length)
-                {
-                    throw new ArgumentException(UiText.OutputDirectoryArgumentRequired);
-                }
-                outputDirectory = args[++i];
-            }
-            else if (IsOption(arg, "--render-profile-log"))
-            {
-                i++;
-            }
-            else if (IsOption(arg, "--render-benchmark-log"))
-            {
-                i++;
-            }
-            else if (IsOption(arg, "--render-benchmark-frames"))
-            {
-                i++;
-            }
-        }
-
-        return AppSettingsStore.NormalizeDirectory(outputDirectory);
-    }
-
     private static string[] GetInputArgs(string[] args)
     {
         List<string> input = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
-            string value;
-            if (TryGetInlineOption(args[i], "--output-dir", out value) ||
-                TryGetInlineOption(args[i], "--render-profile", out value) ||
-                TryGetInlineOption(args[i], "--render-profile-log", out value) ||
-                TryGetInlineOption(args[i], "--render-benchmark-log", out value) ||
-                TryGetInlineOption(args[i], "--render-benchmark-frames", out value))
-            {
-                continue;
-            }
-            if (IsOption(args[i], "--output-dir") ||
-                IsOption(args[i], "--render-profile-log") ||
-                IsOption(args[i], "--render-benchmark-log") ||
-                IsOption(args[i], "--render-benchmark-frames"))
-            {
-                i++;
-                continue;
-            }
-            if (IsOption(args[i], "--render-profile") || IsOption(args[i], "--render-benchmark"))
+            if (IsOption(args[i], "--screenshot") ||
+                IsOption(args[i], "--background") ||
+                IsOption(args[i], "--settings"))
             {
                 continue;
             }
@@ -154,98 +110,16 @@ internal static class Program
         return input.ToArray();
     }
 
-    private static void ConfigureRenderPerformanceProbe(string[] args)
-    {
-        bool enabled = IsTruthy(Environment.GetEnvironmentVariable(RenderProfileEnvironmentVariable));
-        string logPath = Environment.GetEnvironmentVariable(RenderProfileLogEnvironmentVariable);
-        for (int i = 0; i < args.Length; i++)
-        {
-            string value;
-            if (IsOption(args[i], "--render-profile"))
-            {
-                enabled = true;
-            }
-            else if (TryGetInlineOption(args[i], "--render-profile", out value))
-            {
-                enabled = IsTruthy(value);
-            }
-            else if (TryGetInlineOption(args[i], "--render-profile-log", out value))
-            {
-                logPath = value;
-            }
-            else if (IsOption(args[i], "--render-profile-log") && i + 1 < args.Length)
-            {
-                logPath = args[++i];
-            }
-        }
-        RenderPerformanceProbe.Configure(enabled, logPath);
-    }
-
-    private static bool IsBenchmarkRequested(string[] args)
+    private static bool IsOptionPresent(string[] args, string option)
     {
         for (int i = 0; i < args.Length; i++)
         {
-            if (IsOption(args[i], "--render-benchmark"))
+            if (IsOption(args[i], option))
             {
                 return true;
             }
         }
         return false;
-    }
-
-    private static void RunBenchmark(string[] args)
-    {
-        int frames = 60;
-        string logPath = Path.Combine(Path.GetTempPath(), "QuickerImageAnnotator-render-benchmark.md");
-        for (int i = 0; i < args.Length; i++)
-        {
-            string value;
-            if (TryGetInlineOption(args[i], "--render-benchmark-frames", out value))
-            {
-                int.TryParse(value, out frames);
-            }
-            else if (IsOption(args[i], "--render-benchmark-frames") && i + 1 < args.Length)
-            {
-                int.TryParse(args[++i], out frames);
-            }
-            else if (TryGetInlineOption(args[i], "--render-benchmark-log", out value))
-            {
-                logPath = value;
-            }
-            else if (IsOption(args[i], "--render-benchmark-log") && i + 1 < args.Length)
-            {
-                logPath = args[++i];
-            }
-        }
-        frames = Math.Max(1, frames);
-
-        BenchmarkCase[] cases = new BenchmarkCase[]
-        {
-            new BenchmarkCase("1080p", 1920, 1080, 1280, 720),
-            new BenchmarkCase("4k", 3840, 2160, 1600, 900),
-            new BenchmarkCase("8k", 7680, 4320, 1600, 900),
-            new BenchmarkCase("long-shot", 1440, 6400, 900, 1400)
-        };
-
-        StringBuilder report = new StringBuilder();
-        report.AppendLine("# Render Benchmark");
-        report.AppendLine();
-        report.AppendLine("| case | image | canvas | actual_backend | hardware_accelerated | avg_ms | p50_ms | p95_ms | max_ms |");
-        report.AppendLine("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |");
-        for (int i = 0; i < cases.Length; i++)
-        {
-            BenchmarkResult result = RunBenchmarkCase(cases[i], frames);
-            report.Append("| ").Append(cases[i].Name)
-                .Append(" | ").Append(cases[i].Width).Append("x").Append(cases[i].Height)
-                .Append(" | ").Append(cases[i].CanvasWidth).Append("x").Append(cases[i].CanvasHeight)
-                .Append(" | GpuRenderer | yes | ")
-                .Append(result.Avg.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
-                .Append(result.P50.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
-                .Append(result.P95.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(" | ")
-                .Append(result.Max.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).AppendLine(" |");
-        }
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(logPath)));
-        File.WriteAllText(logPath, report.ToString(), new UTF8Encoding(false));
     }
 
     private static BenchmarkResult RunBenchmarkCase(BenchmarkCase benchmarkCase, int frames)
@@ -319,11 +193,15 @@ internal static class Program
     {
         AssertNoForbiddenDependencies();
         AssertWicRoundTrip();
+        AssertScreenCapture();
+        AssertScreenSelection();
         AssertGpuExport();
         AssertDirectWriteTextLayout();
         AssertGpuRendererRebuild();
         AssertGpuWindowChromeRender();
         AssertGpuInteractionSemantics();
+        AssertAppFeatureSemantics();
+        AssertOcrSemantics();
         AssertClipboardWorkflow();
         AssertClipboardStartupSmoke();
         AssertBenchmarkSmoke();
@@ -372,6 +250,69 @@ internal static class Program
             {
                 throw new InvalidOperationException("WIC roundtrip self test failed.");
             }
+        }
+    }
+
+    private static void AssertScreenCapture()
+    {
+        string path = ScreenCapture.CapturePrimaryScreenToTempFileForSelfTest(32, 24);
+        try
+        {
+            using (WicImageDocument loaded = WicImageDocument.Load(path))
+            {
+                if (loaded.Width <= 0 || loaded.Height <= 0 || loaded.Width > 32 || loaded.Height > 24)
+                {
+                    throw new InvalidOperationException("Screen capture self test produced an unexpected image size.");
+                }
+            }
+        }
+        finally
+        {
+            TryDeleteFile(path);
+        }
+    }
+
+    private static void AssertScreenSelection()
+    {
+        Win32Api.NativeRect normalized = ScreenSelectionWindow.NormalizeRegionForSelfTest(-5, 8, 12, 2, 10, 10);
+        if (normalized.left != 0 || normalized.top != 2 || normalized.right != 10 || normalized.bottom != 8)
+        {
+            throw new InvalidOperationException("Screen selection normalization self test failed.");
+        }
+
+        Win32Api.NativeRect windowRect = new Win32Api.NativeRect();
+        windowRect.left = -90;
+        windowRect.top = -40;
+        windowRect.right = 260;
+        windowRect.bottom = 180;
+        Win32Api.NativeRect converted;
+        if (!ScreenSelectionWindow.TryConvertWindowRectForSelfTest(windowRect, -100, -50, 320, 240, out converted) ||
+            converted.left != 10 || converted.top != 10 || converted.right != 320 || converted.bottom != 230)
+        {
+            throw new InvalidOperationException("Screen window selection conversion self test failed.");
+        }
+
+        byte[] source = new byte[4 * 3 * 4];
+        for (int i = 0; i < source.Length; i += 4)
+        {
+            int pixel = i / 4;
+            source[i] = (byte)pixel;
+            source[i + 1] = (byte)(pixel + 30);
+            source[i + 2] = (byte)(pixel + 60);
+            source[i + 3] = 255;
+        }
+
+        Win32Api.NativeRect region = new Win32Api.NativeRect();
+        region.left = 1;
+        region.top = 1;
+        region.right = 3;
+        region.bottom = 3;
+        int width;
+        int height;
+        byte[] copied = ScreenCapture.CopyRegionPixels(source, 4, 3, region, out width, out height);
+        if (width != 2 || height != 2 || copied.Length != 16 || copied[0] != 5 || copied[4] != 6 || copied[8] != 9 || copied[12] != 10)
+        {
+            throw new InvalidOperationException("Screen selection crop self test failed.");
         }
     }
 
@@ -485,7 +426,7 @@ internal static class Program
 
         using (WicImageDocument image = WicImageDocument.CreateSynthetic(80, 60))
         {
-            GpuAnnotatorWindow window = new GpuAnnotatorWindow("selftest.png", image, null, 0);
+            GpuAnnotatorWindow window = new GpuAnnotatorWindow("selftest.png", image, null, null, false);
             Type type = typeof(GpuAnnotatorWindow);
             System.Reflection.BindingFlags instanceFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
             System.Reflection.BindingFlags staticFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
@@ -651,6 +592,145 @@ internal static class Program
             {
                 throw new InvalidOperationException("GPU existing text edit undo self test failed.");
             }
+        }
+    }
+
+    private static void AssertAppFeatureSemantics()
+    {
+        ToolbarCommand command;
+        if (!AppShortcuts.TryGetToolbarCommand(Win32Api.VkD1, false, false, out command) || command != ToolbarCommand.ToolRect ||
+            !AppShortcuts.TryGetToolbarCommand(Win32Api.VkD6, false, false, out command) || command != ToolbarCommand.ToolText ||
+            !AppShortcuts.TryGetToolbarCommand(Win32Api.VkF, true, false, out command) || command != ToolbarCommand.Fit ||
+            !AppShortcuts.TryGetToolbarCommand(Win32Api.VkO, true, false, out command) || command != ToolbarCommand.Ocr ||
+            !AppShortcuts.TryGetToolbarCommand(Win32Api.VkS, true, false, out command) || command != ToolbarCommand.Save ||
+            AppShortcuts.TryGetToolbarCommand(Win32Api.VkD1, false, true, out command))
+        {
+            throw new InvalidOperationException("Shortcut mapping self test failed.");
+        }
+
+        string tooltip = AppShortcuts.GetTooltip(ToolbarCommand.Save);
+        if (tooltip.IndexOf("Ctrl+S", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException("Shortcut tooltip self test failed.");
+        }
+        if (!string.Equals(AppFeatures.GetGlobalHotkeyText(new AppSettings()), "Alt+A", StringComparison.Ordinal) ||
+            !string.Equals(AppFeatures.GetGlobalHotkeyText(new AppSettings { GlobalHotkeyModifiers = Win32Api.HotkeyModControl | Win32Api.HotkeyModShift, GlobalHotkeyKey = Win32Api.VkD2 }), "Ctrl+Shift+2", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Global hotkey text self test failed.");
+        }
+        if (BackgroundTrayIcon.GetTooltipForSelfTest().IndexOf(AppFeatures.GlobalHotkeyText, StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException("Tray tooltip self test failed.");
+        }
+        AppSettings traySettings = new AppSettings();
+        if (!string.Equals(BackgroundTrayIcon.ResolveOutputDirectoryForSelfTest(traySettings), Path.GetTempPath(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Tray output directory fallback self test failed.");
+        }
+        traySettings.OutputDirectory = Path.Combine(Path.GetTempPath(), "quicker-annotated");
+        if (!string.Equals(BackgroundTrayIcon.ResolveScreenshotDirectoryForSelfTest(traySettings), traySettings.OutputDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Tray screenshot directory fallback self test failed.");
+        }
+        traySettings.ScreenshotDirectory = Path.Combine(Path.GetTempPath(), "quicker-screenshots");
+        if (!string.Equals(BackgroundTrayIcon.ResolveScreenshotDirectoryForSelfTest(traySettings), traySettings.ScreenshotDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Tray screenshot directory self test failed.");
+        }
+
+        string exe = Path.Combine(Path.GetTempPath(), "AnnotatorApp.exe");
+        string commandLine = AppFeatures.BuildAutoStartCommand(exe);
+        if (!AppFeatures.IsAutoStartCommand(commandLine, exe) ||
+            AppFeatures.IsAutoStartCommand(AppFeatures.QuoteArgument(exe) + " --screenshot", exe))
+        {
+            throw new InvalidOperationException("Startup command self test failed.");
+        }
+
+        string[] filtered = GetInputArgs(new string[]
+        {
+            "--screenshot",
+            "--background",
+            "--settings",
+            "sample.png"
+        });
+        if (filtered.Length != 1 || !string.Equals(filtered[0], "sample.png", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Command-line option filtering self test failed.");
+        }
+
+        if (!IsOptionPresent(new string[] { "--screenshot" }, "--screenshot") ||
+            !IsOptionPresent(new string[] { "--background" }, "--background") ||
+            !IsOptionPresent(new string[] { "--settings" }, "--settings") ||
+            IsOptionPresent(new string[] { "/screenshot" }, "--screenshot") ||
+            IsOptionPresent(new string[] { "-background" }, "--background"))
+        {
+            throw new InvalidOperationException("Command-line option matching self test failed.");
+        }
+
+        Win32Api.NativeRect sizeRegion = new Win32Api.NativeRect();
+        sizeRegion.left = 3;
+        sizeRegion.top = 4;
+        sizeRegion.right = 23;
+        sizeRegion.bottom = 14;
+        if (!string.Equals(ScreenSelectionWindow.GetRegionSizeTextForSelfTest(sizeRegion), "20 x 10", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Screen selection HUD self test failed.");
+        }
+        Win32Api.NativeRect magnifier = ScreenSelectionWindow.GetMagnifierRectForSelfTest(315, 235, 320, 240);
+        if (magnifier.left < 0 || magnifier.top < 0 || magnifier.right > 320 || magnifier.bottom > 240 || magnifier.right - magnifier.left != 136 || magnifier.bottom - magnifier.top != 136)
+        {
+            throw new InvalidOperationException("Screen selection magnifier self test failed.");
+        }
+    }
+
+    private static void AssertOcrSemantics()
+    {
+        List<string> lines = new List<string>();
+        lines.Add("Hello");
+        lines.Add("world.");
+        lines.Add("\u4e0b\u4e00\u884c");
+        lines.Add("\u7ee7\u7eed");
+
+        string lineText = OcrTextFormatter.Format(lines, OcrTextLayout.Lines);
+        if (lineText.IndexOf(Environment.NewLine, StringComparison.Ordinal) <= 0)
+        {
+            throw new InvalidOperationException("OCR line layout self test failed.");
+        }
+
+        string paragraph = OcrTextFormatter.Format(lines, OcrTextLayout.SmartParagraph);
+        string expectedParagraph = "Hello world." + Environment.NewLine + Environment.NewLine + "\u4e0b\u4e00\u884c\u7ee7\u7eed";
+        if (!string.Equals(paragraph, expectedParagraph, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("OCR smart paragraph layout self test failed.");
+        }
+
+        List<string> hyphenLines = new List<string>();
+        hyphenLines.Add("inter-");
+        hyphenLines.Add("national");
+        if (!string.Equals(OcrTextFormatter.Format(hyphenLines, OcrTextLayout.SmartParagraph), "international", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("OCR smart paragraph hyphen self test failed.");
+        }
+
+        string translated = GoogleTranslateClient.ParseTranslatedTextForSelfTest("[[[\"\u4f60\u597d\",\"Hello\",null,null,10],[\"\uff0c\u4e16\u754c\",\" world\",null,null,10]],null,\"en\"]");
+        if (!string.Equals(translated, "\u4f60\u597d\uff0c\u4e16\u754c", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Google translate parser self test failed.");
+        }
+
+        string protectedSecret = AppSettingsStore.ProtectSecretForSelfTest("secret-for-self-test");
+        if (string.IsNullOrEmpty(protectedSecret) ||
+            string.Equals(protectedSecret, "secret-for-self-test", StringComparison.Ordinal) ||
+            !string.Equals(AppSettingsStore.UnprotectSecretForSelfTest(protectedSecret), "secret-for-self-test", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("OCR secret protection self test failed.");
+        }
+
+        if (BaiduOcrClient.NormalizeEngine(OcrEngineKind.Accurate) != OcrEngineKind.Accurate ||
+            OcrTextFormatter.NormalizeLayout((OcrTextLayout)999) != OcrTextLayout.SmartParagraph ||
+            AppShortcuts.GetTooltip(ToolbarCommand.Ocr).IndexOf("Ctrl+O", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException("OCR settings semantics self test failed.");
         }
     }
 
@@ -831,48 +911,9 @@ internal static class Program
         }
     }
 
-    private static bool TryGetInlineOption(string arg, string option, out string value)
-    {
-        value = null;
-        string[] prefixes = new string[]
-        {
-            option + "=",
-            option + ":",
-            "-" + option.TrimStart('-') + "=",
-            "-" + option.TrimStart('-') + ":",
-            "/" + option.TrimStart('-') + "=",
-            "/" + option.TrimStart('-') + ":"
-        };
-        for (int i = 0; i < prefixes.Length; i++)
-        {
-            if (arg.StartsWith(prefixes[i], StringComparison.OrdinalIgnoreCase))
-            {
-                value = arg.Substring(prefixes[i].Length);
-                return true;
-            }
-        }
-        return false;
-    }
-
     private static bool IsOption(string arg, string option)
     {
-        string trimmed = option.TrimStart('-');
-        return string.Equals(arg, option, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(arg, "-" + trimmed, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(arg, "/" + trimmed, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsTruthy(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-        value = value.Trim();
-        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(arg, option, StringComparison.OrdinalIgnoreCase);
     }
 
     private static void WriteFailure(Exception exception)
@@ -880,6 +921,25 @@ internal static class Program
         try
         {
             File.WriteAllText(Path.Combine(Path.GetTempPath(), "QuickerImageAnnotator-selftest-error.log"), exception.ToString());
+        }
+        catch
+        {
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
         }
         catch
         {
